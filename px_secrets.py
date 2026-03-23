@@ -346,14 +346,14 @@ h1{font-size:22px;font-weight:600;color:var(--accent)}
   <button class="btn" onclick="loadVault()">Refresh</button>
   <button class="btn" onclick="showSettingsModal()">Settings</button>
   <button class="btn" onclick="fetch('/api/open-browser')">Browser</button>
-  <a class="btn" href=\"""" + SUPPORT_URL + r"""\" target="_blank" rel="noopener" style="text-decoration:none;color:var(--success);border-color:var(--success)">Support</a>
+  <a class="btn" href=\"""" + SUPPORT_URL + r"""\" target="_blank" rel="noopener" style="text-decoration:none">&hearts;</a>
 </div>
 
 <div class="cards" id="cards"></div>
 
 <div class="status-bar" id="status-bar">Loading...</div>
 <div class="cli-ref mono">CLI: px_secrets.py --list | --get SERVICE KEY | --help</div>
-<div style="margin-top:6px;text-align:center;font-size:11px;color:var(--muted)">Open source &mdash; <a href=\"""" + SUPPORT_URL + r"""\" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:none">Buy me a coffee</a> if you find this useful</div>
+<div style="margin-top:6px;text-align:center;font-size:11px;color:var(--muted)">Free &amp; open source &hearts; <a href=\"""" + SUPPORT_URL + r"""\" target="_blank" rel="noopener" style="color:var(--muted);text-decoration:none;border-bottom:1px dotted var(--border)">support the project</a></div>
 
 <!-- Add Secret Modal -->
 <div class="modal-overlay" id="add-modal">
