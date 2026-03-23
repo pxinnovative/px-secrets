@@ -258,34 +258,49 @@ EOF
 launchctl load ~/Library/LaunchAgents/com.pxsecrets.headless.plist
 ```
 
+## Community
+
+- Star this repo if PX Secrets is useful to you
+- Join the conversation in [GitHub Discussions](../../discussions)
+- Report bugs or request features in [GitHub Issues](../../issues)
+- Share your experience — we want to hear how you use it
+- PRs welcome — see [CONTRIBUTING.md](CONTRIBUTING.md)
+
+We're building in public and we want your input. PX Secrets is part of [PX Open Suite](https://github.com/pxinnovative) — a collection of free, local-first tools for developers and creators.
+
 ## Roadmap
 
-- [ ] Onboarding wizard (first-run setup flow)
+- [x] Dark GUI with search and service grouping
+- [x] CLI access (`--list`, `--get`)
+- [x] Headless mode for background service
+- [x] Native window mode (pywebview)
+- [x] Clipboard auto-clear (30s)
+- [x] Notes per secret
+- [x] Configurable vault path, AGE key, and port
+- [ ] One-command installer (`install.sh`)
+- [ ] Onboarding wizard (first-run setup with key generation)
 - [ ] Self-update from GitHub
 - [ ] About dialog with version info
 - [ ] Secret rotation reminders
 - [ ] Import/export vault
+- [ ] Key rotation support
+- [ ] Homebrew cask (`brew install --cask px-secrets`)
 
 See [Issues](../../issues) for the full list.
 
-## License
-
-AGPL-3.0 — see [LICENSE](LICENSE)
-
-## Contributing
-
-Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
-## Trademark
-
-"PX Secrets" is a trademark of PX Innovative Solutions Inc. See [TRADEMARK.md](TRADEMARK.md).
-
----
-
 ## Support
 
-If PX Secrets saves you time or makes your workflow better, consider [buying us a coffee](https://buymeacoffee.com/pxinnovative). It helps us keep building free, open-source tools.
+- **Bug reports:** [GitHub Issues](../../issues)
+- **Questions & ideas:** [GitHub Discussions](../../discussions)
+- **Buy me a coffee:** [buymeacoffee.com/pxinnovative](https://buymeacoffee.com/pxinnovative)
+- **Star the repo** — it helps more than you think
+
+## License
+
+[AGPL-3.0](LICENSE) — free to use, modify, and distribute. If you distribute a modified version, you must share the source.
+
+"PX Secrets" is a trademark of PX Innovative Solutions Inc. — see [TRADEMARK.md](TRADEMARK.md).
 
 ---
 
-Built with privacy in mind by [PX Innovative Solutions Inc.](https://github.com/pxinnovative)
+Made with 🔐 by [Victor Kerber](https://github.com/pxinnovative) @ [PX Innovative Solutions Inc.](https://pxinnovative.com)
