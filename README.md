@@ -1,12 +1,19 @@
 # PX Secrets
 
-**Free & open-source secrets manager for your local machine — 100% local, private, no cloud.**
+### Stop hardcoding your API keys. Stop leaking secrets to GitHub. Stop paying for a vault you don't need.
 
-Manage your API keys, tokens, and credentials with a beautiful dark UI. Encrypted at rest with [SOPS](https://github.com/getsops/sops) + [AGE](https://github.com/FiloSottile/age) — battle-tested, industry-standard encryption. No subscription. No data leaves your machine. Free and open-source.
+**PX Secrets** is a free, open-source secrets manager that runs entirely on your machine. Beautiful dark UI, CLI access, and a local API your AI agents can query at runtime — so your keys never touch code, `.env` files, or git history.
 
-Perfect for developers, homelabbers, sysadmins — anyone who needs a simple, secure, local vault for their secrets.
+Encrypted with [SOPS](https://github.com/getsops/sops) + [AGE](https://github.com/FiloSottile/age) — the same encryption trusted by DevOps teams worldwide. No cloud. No subscription. No telemetry. **Your secrets stay on your machine, period.**
 
-> If you find PX Secrets useful, please consider giving it a star on GitHub. It helps others discover it and motivates us to keep building.
+```bash
+# Your agent fetches secrets at runtime — nothing hardcoded, nothing leaked
+export OPENAI_API_KEY=$(python3 px_secrets.py --get openai api_key)
+```
+
+Perfect for developers, AI builders, homelabbers, and sysadmins who want real encryption without the complexity of HashiCorp Vault or the recurring cost of 1Password.
+
+> If PX Secrets helps you sleep better at night, give it a star — it helps others find it and keeps us building free tools.
 
 <!-- TODO: Add screenshot here -->
 <!-- ![PX Secrets UI](screenshot.png) -->
