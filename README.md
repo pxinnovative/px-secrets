@@ -159,6 +159,60 @@ Reading secrets reverses the process — SOPS decrypts using your AGE private ke
 - **Temp file cleanup** — Decrypted data is never written to disk permanently
 - **127.0.0.1 only** — The web server binds to localhost, inaccessible from the network
 
+## Use with AI Agents and Scripts
+
+PX Secrets isn't just for humans — it's designed to keep your **AI agents, automation scripts, and CI/CD pipelines** safe from secret leaks.
+
+### The problem
+
+Every day, API keys and tokens end up exposed because developers:
+- Hardcode them in scripts (`OPENAI_API_KEY = "sk-..."`)
+- Store them in `.env` files that accidentally get committed to GitHub
+- Pass them as environment variables that show up in logs
+- Copy-paste them into AI agent configs that get shared or versioned
+
+**One leaked key can cost thousands of dollars or compromise your entire infrastructure.**
+
+### The solution
+
+Run PX Secrets in headless mode and let your agents query secrets at runtime — nothing is ever written to code, `.env` files, or git history.
+
+#### CLI — perfect for shell scripts and agents
+
+```bash
+# Your agent fetches the key at runtime — never stored in code
+export OPENAI_API_KEY=$(python3 px_secrets.py --get openai api_key)
+
+# Use in any script
+curl -H "Authorization: Bearer $(python3 px_secrets.py --get github token)" \
+  https://api.github.com/user
+```
+
+#### API — perfect for Python agents and automation
+
+```python
+import requests
+
+# Your agent queries PX Secrets locally — no .env file needed
+vault = requests.get("http://127.0.0.1:9999/api/vault").json()
+api_key = vault["openai"]["api_key"]
+
+# Use the key — it only exists in memory, never on disk
+client = OpenAI(api_key=api_key)
+```
+
+#### Why this matters
+
+| Without PX Secrets | With PX Secrets |
+|---|---|
+| `sk-abc123...` hardcoded in your script | Secret fetched at runtime, never in code |
+| `.env` file with all your keys | No `.env` file needed |
+| Keys in git history forever (even after deletion) | Nothing to commit — vault is separate and encrypted |
+| Agent configs with plaintext tokens | Agent queries localhost API, gets key in memory only |
+| One leaked `.env` = all secrets exposed | Vault is encrypted — useless without your AGE key |
+
+> **Tip:** Run `python3 px_secrets.py --headless` as a background service. Your agents can query `http://127.0.0.1:9999/api/vault` whenever they need a secret — zero risk of leaking credentials into code or logs.
+
 ## Optional: Native Window
 
 For a desktop-app experience without a browser tab:
