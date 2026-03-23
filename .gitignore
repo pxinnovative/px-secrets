@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# Encrypted vaults (NEVER publish)
+*.enc.yaml
+*.enc.json
+
+# AGE keys (NEVER publish)
+keys.txt
+*.age
+
+# User preferences (local config)
+preferences.json
+config.json
+
+# Internal strategy/planning docs (NEVER publish)
+LAUNCH-STRATEGY.md
+*-strategy.md
+*-strategy-*.md
+
+# Virtual environments
+.venv/
+venv/

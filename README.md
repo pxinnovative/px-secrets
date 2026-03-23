@@ -1,0 +1,228 @@
+# PX Secrets
+
+**Free & open-source secrets manager for your local machine — 100% local, private, no cloud.**
+
+Manage your API keys, tokens, and credentials with a beautiful dark UI. Encrypted at rest with [SOPS](https://github.com/getsops/sops) + [AGE](https://github.com/FiloSottile/age) — battle-tested, industry-standard encryption. No subscription. No data leaves your machine. Free and open-source.
+
+Perfect for developers, homelabbers, sysadmins — anyone who needs a simple, secure, local vault for their secrets.
+
+> If you find PX Secrets useful, please consider giving it a star on GitHub. It helps others discover it and motivates us to keep building.
+
+<!-- TODO: Add screenshot here -->
+<!-- ![PX Secrets UI](screenshot.png) -->
+
+---
+
+## Why PX Secrets?
+
+| | PX Secrets | 1Password / Bitwarden | HashiCorp Vault | .env files |
+|---|---|---|---|---|
+| **Cost** | Free forever | Subscription | Free (complex) | Free |
+| **Data location** | Your machine only | Their cloud | Your server | Your machine |
+| **Encryption** | SOPS + AGE (industry standard) | Proprietary | Proprietary | None |
+| **Setup time** | 2 minutes | Account creation | Hours | Seconds |
+| **Network required** | Never | Always | Yes (server) | No |
+| **GUI** | Yes (web + native) | Yes | No | No |
+| **CLI** | Yes | Yes | Yes | Manual |
+| **Open source** | AGPL-3.0 | Partial | BSL | N/A |
+
+PX Secrets fills the gap between "I keep my secrets in `.env` files" and "I need a full enterprise vault." It gives you real encryption, a clean UI, and CLI access — without any cloud dependency or complex setup.
+
+---
+
+## Features
+
+- **Local encryption** — SOPS + AGE encrypt your vault on disk. Zero data leaves your machine.
+- **Dark GUI** — Clean, dark-themed web UI with search, service grouping, and accordion cards.
+- **CLI access** — List services, retrieve secrets by name, pipe to scripts.
+- **Native window** — Optional pywebview mode for a desktop-app experience.
+- **Clipboard auto-clear** — Copied secrets are wiped from clipboard after 30 seconds.
+- **Notes per secret** — Attach context to any key (expiration dates, rotation info, etc.).
+- **Settings UI** — Configure vault path, AGE key file, and public key from the GUI.
+- **Headless mode** — Run as a background server for automation and LaunchAgents.
+- **Single file** — One Python file, no build step, no complex setup.
+- **Privacy by design** — No telemetry, no analytics, no network calls. Ever.
+
+## System Requirements
+
+- **Python** 3.9+
+- **macOS** or **Linux** (Windows may work but is untested)
+- **SOPS** — `brew install sops` or [install from GitHub](https://github.com/getsops/sops)
+- **AGE** — `brew install age` or [install from GitHub](https://github.com/FiloSottile/age)
+
+## Quick Start
+
+### 1. Install dependencies
+
+```bash
+# macOS (Homebrew)
+brew install sops age
+pip3 install flask pyyaml
+
+# Linux
+# Install sops and age from their GitHub releases, then:
+pip3 install flask pyyaml
+```
+
+Or install from the repo (handles Python dependencies automatically):
+
+```bash
+git clone https://github.com/pxinnovative/px-secrets.git
+cd px-secrets
+pip3 install .
+```
+
+### 2. Generate an AGE key (if you don't have one)
+
+```bash
+mkdir -p ~/.config/sops/age
+age-keygen -o ~/.config/sops/age/keys.txt
+```
+
+This prints your **public key** — something like `age1abc123...`. Copy it; you'll need it in the next step.
+
+### 3. Run PX Secrets and configure
+
+```bash
+python3 px_secrets.py
+```
+
+Your browser opens automatically to `http://127.0.0.1:9999`.
+
+**Important — first-time setup:**
+1. Click **Settings**
+2. Paste your AGE **public key** into the "AGE Public Key" field
+3. Click **Save**
+
+This tells SOPS which key to use for encryption. Without it, adding secrets will fail.
+
+### 4. Add your first secret
+
+Click **+ Add**, enter a service name (e.g., `github`), a key name (e.g., `token`), and the secret value. PX Secrets creates an encrypted vault at `~/secrets/vault.enc.yaml`.
+
+## Usage
+
+### GUI (default)
+
+```bash
+python3 px_secrets.py              # Opens in browser
+python3 px_secrets.py --native     # Opens in native window (requires pywebview)
+python3 px_secrets.py --headless   # Server only, no browser
+python3 px_secrets.py --port 8888  # Custom port
+```
+
+### CLI
+
+```bash
+python3 px_secrets.py --list               # List all services and keys
+python3 px_secrets.py --get github token   # Print a secret value (for scripting)
+```
+
+Pipe to clipboard:
+```bash
+python3 px_secrets.py --get aws secret_key | pbcopy   # macOS
+python3 px_secrets.py --get aws secret_key | xclip     # Linux
+```
+
+### Configuration
+
+On first run, click **Settings** to configure:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| Vault File Path | `~/secrets/vault.enc.yaml` | Where your encrypted vault lives |
+| AGE Key File | `~/.config/sops/age/keys.txt` | Your private AGE key for decryption |
+| AGE Public Key | *(empty — must be set)* | Your public AGE key for encryption |
+
+Settings are saved to `~/.px-secrets/config.json`.
+
+## How It Works
+
+1. You add a secret through the UI or API
+2. PX Secrets writes the data to a temporary YAML file
+3. SOPS encrypts the file using your AGE public key
+4. The encrypted vault is saved to disk
+5. The temporary file is deleted immediately
+
+Reading secrets reverses the process — SOPS decrypts using your AGE private key, PX Secrets parses the YAML, and the decrypted data is only ever held in memory.
+
+**Your AGE private key never leaves `~/.config/sops/age/keys.txt`.** SOPS reads it directly — PX Secrets never touches it.
+
+## Privacy & Security
+
+- **No network calls** — PX Secrets never contacts any server, ever
+- **No telemetry** — No analytics, no usage tracking, no crash reports
+- **No cloud** — Your vault is a local file, encrypted with keys you control
+- **Clipboard auto-clear** — Secrets copied to clipboard are wiped after 30 seconds
+- **Temp file cleanup** — Decrypted data is never written to disk permanently
+- **127.0.0.1 only** — The web server binds to localhost, inaccessible from the network
+
+## Optional: Native Window
+
+For a desktop-app experience without a browser tab:
+
+```bash
+pip3 install pywebview
+python3 px_secrets.py --native
+```
+
+## Optional: Run at Login (macOS)
+
+Create a LaunchAgent to start PX Secrets automatically:
+
+```bash
+cat > ~/Library/LaunchAgents/com.pxsecrets.headless.plist << 'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.pxsecrets.headless</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/path/to/px_secrets.py</string>
+        <string>--headless</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+</dict>
+</plist>
+EOF
+
+launchctl load ~/Library/LaunchAgents/com.pxsecrets.headless.plist
+```
+
+## Roadmap
+
+- [ ] Onboarding wizard (first-run setup flow)
+- [ ] Self-update from GitHub
+- [ ] About dialog with version info
+- [ ] Secret rotation reminders
+- [ ] Import/export vault
+
+See [Issues](../../issues) for the full list.
+
+## License
+
+AGPL-3.0 — see [LICENSE](LICENSE)
+
+## Contributing
+
+Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+## Trademark
+
+"PX Secrets" is a trademark of PX Innovative Solutions Inc. See [TRADEMARK.md](TRADEMARK.md).
+
+---
+
+## Support
+
+If PX Secrets saves you time or makes your workflow better, consider [buying us a coffee](https://buymeacoffee.com/pxinnovative). It helps us keep building free, open-source tools.
+
+---
+
+Built with privacy in mind by [PX Innovative Solutions Inc.](https://github.com/pxinnovative)
