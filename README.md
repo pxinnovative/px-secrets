@@ -79,7 +79,9 @@ mkdir -p ~/.config/sops/age
 age-keygen -o ~/.config/sops/age/keys.txt
 ```
 
-This prints your **public key** — something like `age1abc123...`. Copy it; you'll need it in the next step.
+This prints your **public key** (starts with `age1...`) and saves your **private key** to the file.
+
+> **IMPORTANT: Back up your private key NOW.** Open `~/.config/sops/age/keys.txt`, copy the entire contents, and save it in your password manager (1Password, Bitwarden, KeePass, etc.). If you lose this key, **your encrypted secrets cannot be recovered. Ever.** There is no reset, no recovery, no backdoor. The private key is the only way to decrypt your vault.
 
 ### 3. Run PX Secrets and configure
 
