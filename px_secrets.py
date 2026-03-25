@@ -445,8 +445,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
 body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,sans-serif;font-size:15px;padding:16px;max-width:800px;margin:0 auto}
 code,pre,.mono{font-family:"SF Mono",SFMono-Regular,Menlo,Consolas,monospace}
 h1{font-size:22px;font-weight:600;color:var(--accent)}
-.header{display:flex;align-items:baseline;gap:8px;margin-bottom:10px}
+.header{display:flex;align-items:baseline;gap:8px;margin-bottom:10px;position:relative}
 .header small{color:var(--muted);font-size:13px}
+.header-icons{position:absolute;right:0;top:0;display:flex;gap:6px;align-items:center}
+.icon-btn{background:transparent;border:none;color:var(--muted);font-size:16px;cursor:pointer;padding:4px;transition:color .15s;text-decoration:none;line-height:1}
+.icon-btn:hover{color:var(--accent)}
+.icon-btn[title]:hover::after{content:attr(title)}
 .toolbar{display:flex;gap:6px;margin-bottom:10px;align-items:center}
 .toolbar input[type=text]{flex:1;background:var(--card);border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:6px;font-size:14px;outline:none}
 .toolbar input[type=text]:focus{border-color:var(--accent)}
@@ -495,7 +499,7 @@ h1{font-size:22px;font-weight:600;color:var(--accent)}
 .toast{background:rgba(102,187,106,0.15);color:var(--success);border:1px solid rgba(102,187,106,0.3);padding:10px 20px;border-radius:10px;font-size:13px;opacity:0;transform:translateY(10px);transition:all .3s;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);pointer-events:none}
 .toast.show{opacity:1;transform:translateY(0)}
 /* Generator */
-.gen-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px;max-height:60vh;overflow-y:auto}
+.gen-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px;max-height:55vh;overflow-y:auto;padding-right:4px}
 .gen-category{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:10px}
 .gen-category h3{font-size:13px;color:var(--accent);margin-bottom:6px;display:flex;justify-content:space-between;align-items:center}
 .gen-category h3 span{color:var(--muted);font-weight:400;font-size:11px}
@@ -512,18 +516,20 @@ h1{font-size:22px;font-weight:600;color:var(--accent)}
   <h1>""" + APP_NAME + r"""</h1>
   <small>v""" + VERSION + r"""</small>
   <small style="color:var(--muted)">SOPS + AGE</small>
+  <div class="header-icons">
+    <a class="icon-btn" onclick="showSettingsModal()" title="Settings">&#9881;</a>
+    <a class="icon-btn" onclick="fetch('/api/open-browser')" title="Open in browser">&#127760;</a>
+    <a class="icon-btn" href='https://github.com/pxinnovative/px-secrets' target="_blank" rel="noopener" title="Star on GitHub">&#11088;</a>
+  </div>
 </div>
 
 <div class="toolbar">
   <input type="text" id="search" placeholder="Search services or keys...">
   <button class="btn btn-accent" onclick="showAddModal()">+ Add</button>
   <button class="btn" onclick="loadVault()">Refresh</button>
-  <button class="btn" onclick="showSettingsModal()">Settings</button>
-  <button class="btn" onclick="fetch('/api/open-browser')">Browser</button>
   <button class="btn" onclick="showGenerateModal()">Generate</button>
   <button class="btn" onclick="showImportModal()">Import</button>
   <button class="btn" onclick="showExportModal()">Export</button>
-  <a class="btn" href='""" + SUPPORT_URL + r"""' target="_blank" rel="noopener" style="text-decoration:none">&hearts;</a>
 </div>
 
 <div class="cards" id="cards"></div>
@@ -596,12 +602,12 @@ h1{font-size:22px;font-weight:600;color:var(--accent)}
 
 <!-- Generate Modal -->
 <div class="modal-overlay" id="generate-modal">
-  <div class="modal" style="max-width:700px">
-    <div style="display:flex;justify-content:space-between;align-items:center">
+  <div class="modal" style="max-width:700px;max-height:85vh;display:flex;flex-direction:column">
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-shrink:0">
       <h2>Generate Keys &amp; Passwords</h2>
       <button class="btn btn-accent" onclick="regenerateAll()">Regenerate</button>
     </div>
-    <div style="margin-top:4px;font-size:11px;color:var(--muted)">Click any key to copy. All generation is local using <code>crypto.getRandomValues()</code> equivalent.</div>
+    <div style="margin-top:4px;font-size:11px;color:var(--muted);flex-shrink:0">Click any key to copy. All generation is local using Python <code>secrets</code> module.</div>
     <div class="gen-grid" id="gen-grid"></div>
     <div class="modal-actions">
       <button class="btn" onclick="closeModal('generate-modal')">Close</button>
