@@ -16,6 +16,11 @@ import tempfile
 import threading
 import webbrowser
 
+import base64
+import secrets
+import string
+import uuid
+
 import yaml
 from flask import Flask, jsonify, request
 
@@ -24,7 +29,7 @@ from flask import Flask, jsonify, request
 # ---------------------------------------------------------------------------
 
 APP_NAME = "PX Secrets"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 SUPPORT_URL = "https://buymeacoffee.com/pxinnovative"
 
 # Network
@@ -265,6 +270,165 @@ def api_open_browser():
     return jsonify({"ok": True})
 
 
+@app.route("/api/generate")
+def api_generate():
+    """Generate cryptographically secure random keys and passwords."""
+    results = {}
+
+    # Memorable (word-like, easy to type)
+    wordchars = string.ascii_lowercase
+    results["memorable"] = [
+        "-".join("".join(secrets.choice(wordchars) for _ in range(secrets.randbelow(4) + 4)) for _ in range(4))
+        for _ in range(4)
+    ]
+
+    # Strong 16 chars
+    strong_chars = string.ascii_letters + string.digits + "!@#$%^&*()-_=+"
+    results["strong"] = [
+        "".join(secrets.choice(strong_chars) for _ in range(16))
+        for _ in range(4)
+    ]
+
+    # Fort Knox 32 chars
+    fort_chars = string.ascii_letters + string.digits + string.punctuation
+    results["fort_knox"] = [
+        "".join(secrets.choice(fort_chars) for _ in range(32))
+        for _ in range(4)
+    ]
+
+    # Alphanumeric 24 chars
+    alnum = string.ascii_letters + string.digits
+    results["alphanumeric"] = [
+        "".join(secrets.choice(alnum) for _ in range(24))
+        for _ in range(4)
+    ]
+
+    # Hex 128-bit
+    results["hex_128"] = [secrets.token_hex(16) for _ in range(4)]
+
+    # Hex 256-bit
+    results["hex_256"] = [secrets.token_hex(32) for _ in range(4)]
+
+    # UUID v4
+    results["uuid_v4"] = [str(uuid.uuid4()) for _ in range(4)]
+
+    # API Keys (sk_live_ prefix)
+    results["api_keys"] = [
+        "sk_live_" + "".join(secrets.choice(alnum) for _ in range(40))
+        for _ in range(4)
+    ]
+
+    # JWT Secrets (base64, 64 chars)
+    results["jwt_secret"] = [
+        base64.urlsafe_b64encode(secrets.token_bytes(48)).decode()[:64]
+        for _ in range(4)
+    ]
+
+    return jsonify(results)
+
+
+@app.route("/api/export")
+def api_export():
+    """Export vault in the requested format."""
+    fmt = request.args.get("format", "env")
+    try:
+        data = decrypt_vault()
+        if fmt == "json":
+            return jsonify(data)
+        elif fmt == "yaml":
+            return app.response_class(
+                yaml.dump(data, default_flow_style=False),
+                mimetype="text/yaml",
+                headers={"Content-Disposition": "attachment; filename=secrets.yaml"}
+            )
+        else:  # .env format
+            lines = []
+            for svc in sorted(data.keys()):
+                lines.append(f"# {svc}")
+                for key in sorted(data[svc].keys()):
+                    if key.endswith("__note"):
+                        continue
+                    val = data[svc][key]
+                    env_key = f"{svc.upper()}_{key.upper()}"
+                    lines.append(f'{env_key}="{val}"')
+                lines.append("")
+            return app.response_class(
+                "\n".join(lines),
+                mimetype="text/plain",
+                headers={"Content-Disposition": "attachment; filename=.env"}
+            )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/import", methods=["POST"])
+def api_import():
+    """Import secrets from .env, JSON, or YAML format."""
+    try:
+        body = request.json
+        text = body.get("text", "")
+        fmt = body.get("format", "auto")
+        service = body.get("service", "")
+
+        imported = {}
+
+        if fmt == "auto":
+            text_stripped = text.strip()
+            if text_stripped.startswith("{"):
+                fmt = "json"
+            elif ":" in text_stripped.split("\n")[0] and "=" not in text_stripped.split("\n")[0]:
+                fmt = "yaml"
+            else:
+                fmt = "env"
+
+        if fmt == "json":
+            imported = json.loads(text)
+        elif fmt == "yaml":
+            imported = yaml.safe_load(text) or {}
+        else:  # .env
+            svc_name = service or "imported"
+            env_secrets = {}
+            for line in text.split("\n"):
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    k = k.strip()
+                    v = v.strip().strip('"').strip("'")
+                    if k and v:
+                        env_secrets[k.lower()] = v
+            if env_secrets:
+                imported = {svc_name: env_secrets}
+
+        if not imported:
+            return jsonify({"error": "No secrets found in input"}), 400
+
+        # Merge into vault
+        data = decrypt_vault()
+        count = 0
+        for svc, keys in imported.items():
+            if not isinstance(keys, dict):
+                continue
+            if svc not in data:
+                data[svc] = {}
+            for k, v in keys.items():
+                if k.endswith("__note"):
+                    data[svc][k] = v
+                else:
+                    data[svc][k] = str(v)
+                    count += 1
+
+        encrypt_vault(data)
+        return jsonify({"ok": True, "imported": count})
+    except json.JSONDecodeError:
+        return jsonify({"error": "Invalid JSON format"}), 400
+    except yaml.YAMLError:
+        return jsonify({"error": "Invalid YAML format"}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 # ---------------------------------------------------------------------------
 # Embedded HTML/CSS/JS
 # ---------------------------------------------------------------------------
@@ -330,6 +494,16 @@ h1{font-size:22px;font-weight:600;color:var(--accent)}
 .toast-container{position:fixed;bottom:16px;right:16px;z-index:200;display:flex;flex-direction:column;gap:6px}
 .toast{background:rgba(102,187,106,0.15);color:var(--success);border:1px solid rgba(102,187,106,0.3);padding:10px 20px;border-radius:10px;font-size:13px;opacity:0;transform:translateY(10px);transition:all .3s;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);pointer-events:none}
 .toast.show{opacity:1;transform:translateY(0)}
+/* Generator */
+.gen-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px;max-height:60vh;overflow-y:auto}
+.gen-category{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:10px}
+.gen-category h3{font-size:13px;color:var(--accent);margin-bottom:6px;display:flex;justify-content:space-between;align-items:center}
+.gen-category h3 span{color:var(--muted);font-weight:400;font-size:11px}
+.gen-item{font-family:"SF Mono",monospace;font-size:12px;color:var(--text);padding:5px 8px;background:#1a1a1a;border-radius:4px;margin-bottom:4px;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;transition:all .15s;border:1px solid transparent}
+.gen-item:hover{border-color:var(--accent);color:var(--accent)}
+/* Import/Export */
+.import-textarea{width:100%;min-height:150px;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:10px;border-radius:6px;font-family:"SF Mono",monospace;font-size:13px;resize:vertical}
+.format-select{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:6px;font-size:13px}
 </style>
 </head>
 <body>
@@ -346,6 +520,9 @@ h1{font-size:22px;font-weight:600;color:var(--accent)}
   <button class="btn" onclick="loadVault()">Refresh</button>
   <button class="btn" onclick="showSettingsModal()">Settings</button>
   <button class="btn" onclick="fetch('/api/open-browser')">Browser</button>
+  <button class="btn" onclick="showGenerateModal()">Generate</button>
+  <button class="btn" onclick="showImportModal()">Import</button>
+  <button class="btn" onclick="showExportModal()">Export</button>
   <a class="btn" href='""" + SUPPORT_URL + r"""' target="_blank" rel="noopener" style="text-decoration:none">&hearts;</a>
 </div>
 
@@ -413,6 +590,61 @@ h1{font-size:22px;font-weight:600;color:var(--accent)}
     <div class="modal-actions" style="justify-content:center">
       <button class="btn" onclick="confirmResolve(false)">Cancel</button>
       <button class="btn btn-danger" onclick="confirmResolve(true)">Delete</button>
+    </div>
+  </div>
+</div>
+
+<!-- Generate Modal -->
+<div class="modal-overlay" id="generate-modal">
+  <div class="modal" style="max-width:700px">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <h2>Generate Keys &amp; Passwords</h2>
+      <button class="btn btn-accent" onclick="regenerateAll()">Regenerate</button>
+    </div>
+    <div style="margin-top:4px;font-size:11px;color:var(--muted)">Click any key to copy. All generation is local using <code>crypto.getRandomValues()</code> equivalent.</div>
+    <div class="gen-grid" id="gen-grid"></div>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeModal('generate-modal')">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- Import Modal -->
+<div class="modal-overlay" id="import-modal">
+  <div class="modal" style="max-width:500px">
+    <h2>Import Secrets</h2>
+    <label>Format</label>
+    <select class="format-select" id="import-format">
+      <option value="auto">Auto-detect</option>
+      <option value="env">.env (KEY=value)</option>
+      <option value="json">JSON</option>
+      <option value="yaml">YAML</option>
+    </select>
+    <label>Service name (for .env import)</label>
+    <input id="import-service" placeholder="e.g. aws, github (leave empty for 'imported')">
+    <label>Paste your secrets</label>
+    <textarea class="import-textarea" id="import-text" placeholder="API_KEY=sk-abc123&#10;DATABASE_URL=postgres://...&#10;&#10;or paste JSON/YAML"></textarea>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeModal('import-modal')">Cancel</button>
+      <button class="btn btn-accent" onclick="doImport()">Import</button>
+    </div>
+  </div>
+</div>
+
+<!-- Export Modal -->
+<div class="modal-overlay" id="export-modal">
+  <div class="modal">
+    <h2>Export Vault</h2>
+    <p style="font-size:13px;color:var(--danger);margin-bottom:10px">This will create a file with your secrets in plaintext. Handle with care.</p>
+    <label>Format</label>
+    <select class="format-select" id="export-format">
+      <option value="env">.env</option>
+      <option value="json">JSON</option>
+      <option value="yaml">YAML</option>
+    </select>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeModal('export-modal')">Cancel</button>
+      <button class="btn btn-accent" onclick="doExport()">Download</button>
     </div>
   </div>
 </div>
@@ -646,6 +878,87 @@ document.getElementById('search').addEventListener('input', render);
 document.querySelectorAll('.modal-overlay').forEach(el => {
   el.addEventListener('click', e => { if (e.target === el) el.classList.remove('show'); });
 });
+
+// Generator
+const GEN_LABELS = {
+  memorable: ['Memorable', '~20 chars'],
+  strong: ['Strong', '16 chars'],
+  fort_knox: ['Fort Knox', '32 chars'],
+  alphanumeric: ['Alphanumeric', '24 chars'],
+  hex_128: ['128-bit Hex', '32 hex'],
+  hex_256: ['256-bit Hex', '64 hex'],
+  uuid_v4: ['UUID v4', '36 chars'],
+  api_keys: ['API Keys', '48 chars'],
+  jwt_secret: ['JWT Secret', '64 chars']
+};
+
+let genData = {};
+
+function showGenerateModal() {
+  document.getElementById('generate-modal').classList.add('show');
+  regenerateAll();
+}
+
+async function regenerateAll() {
+  const r = await fetch('/api/generate');
+  genData = await r.json();
+  renderGenerator();
+}
+
+function renderGenerator() {
+  const grid = document.getElementById('gen-grid');
+  grid.innerHTML = '';
+  for (const [cat, [label, size]] of Object.entries(GEN_LABELS)) {
+    const vals = genData[cat] || [];
+    let html = `<div class="gen-category"><h3>${label} <span>${size}</span></h3>`;
+    for (const v of vals) {
+      html += `<div class="gen-item" onclick="copyGenKey(this, '${escAttr(v)}')" title="Click to copy">${esc(v)}</div>`;
+    }
+    html += '</div>';
+    grid.innerHTML += html;
+  }
+}
+
+async function copyGenKey(el, val) {
+  await navigator.clipboard.writeText(val);
+  el.style.borderColor = 'var(--success)';
+  el.style.color = 'var(--success)';
+  toast('Copied to clipboard');
+  setTimeout(() => { el.style.borderColor = ''; el.style.color = ''; }, 1000);
+}
+
+// Import
+function showImportModal() {
+  document.getElementById('import-text').value = '';
+  document.getElementById('import-service').value = '';
+  document.getElementById('import-format').value = 'auto';
+  document.getElementById('import-modal').classList.add('show');
+}
+
+async function doImport() {
+  const text = document.getElementById('import-text').value.trim();
+  const fmt = document.getElementById('import-format').value;
+  const service = document.getElementById('import-service').value.trim();
+  if (!text) { toast('Paste some secrets first'); return; }
+  const r = await fetch('/api/import', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({text, format: fmt, service})});
+  const d = await r.json();
+  if (d.error) { toast(d.error); return; }
+  closeModal('import-modal');
+  toast(`Imported ${d.imported} secret${d.imported !== 1 ? 's' : ''} successfully`);
+  loadVault();
+}
+
+// Export
+function showExportModal() {
+  document.getElementById('export-format').value = 'env';
+  document.getElementById('export-modal').classList.add('show');
+}
+
+function doExport() {
+  const fmt = document.getElementById('export-format').value;
+  closeModal('export-modal');
+  window.open('/api/export?format=' + fmt, '_blank');
+}
 
 loadVault();
 </script>
