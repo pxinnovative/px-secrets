@@ -270,6 +270,7 @@ We're building in public and we want your input. PX Secrets is part of [PX Open 
 
 ## Roadmap
 
+**v1.2.0 — Initial Release**
 - [x] Dark GUI with search and service grouping
 - [x] CLI access (`--list`, `--get`)
 - [x] Headless mode for background service
@@ -277,12 +278,19 @@ We're building in public and we want your input. PX Secrets is part of [PX Open 
 - [x] Clipboard auto-clear (30s)
 - [x] Notes per secret
 - [x] Configurable vault path, AGE key, and port
-- [ ] One-command installer (`install.sh`)
-- [ ] Onboarding wizard (first-run setup with key generation)
-- [ ] Self-update from GitHub
+
+**v1.3.0 — Generator & Import/Export**
+- [x] [Built-in key & password generator](../../issues/4) — 9 categories, cryptographically secure
+- [x] [Import/export secrets](../../issues/6) — .env, JSON, YAML (auto-detect)
+
+**Next**
+- [ ] [One-command installer (`install.sh`)](../../issues/1)
+- [ ] [Onboarding wizard (first-run setup with key generation)](../../issues/2)
+- [ ] [Self-update from GitHub](../../issues/3)
+- [ ] [Per-secret rotation with safety confirmation](../../issues/5)
+
+**Future**
 - [ ] About dialog with version info
-- [ ] Secret rotation reminders
-- [ ] Import/export vault
 - [ ] Key rotation support
 - [ ] Homebrew cask (`brew install --cask px-secrets`)
 
