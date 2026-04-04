@@ -30,6 +30,7 @@ from flask import Flask, jsonify, request
 
 APP_NAME = "PX Secrets"
 VERSION = "1.3.0"
+REPO_URL = "https://github.com/pxinnovative/px-secrets"
 SUPPORT_URL = "https://buymeacoffee.com/pxinnovative"
 
 # Network
@@ -535,7 +536,7 @@ h1{font-size:22px;font-weight:600;color:var(--accent)}
 
 <div class="status-bar" id="status-bar">Loading...</div>
 <div class="cli-ref mono">CLI: px_secrets.py --list | --get SERVICE KEY | --help</div>
-<div style="margin-top:6px;text-align:center;font-size:11px;color:var(--muted)">Free &amp; open source &hearts; <a href='""" + SUPPORT_URL + r"""' target="_blank" rel="noopener" style="color:var(--muted);text-decoration:none;border-bottom:1px dotted var(--border)">support the project</a> &nbsp;&middot;&nbsp; <a href="https://github.com/pxinnovative/px-secrets" target="_blank" rel="noopener" style="color:var(--muted);text-decoration:none;border-bottom:1px dotted var(--border)">&#11088; star on GitHub</a></div>
+<div style="margin-top:6px;text-align:center;font-size:11px;color:var(--muted)">Free &amp; open source &hearts; <a href='""" + SUPPORT_URL + r"""' target="_blank" rel="noopener" style="color:var(--muted);text-decoration:none;border-bottom:1px dotted var(--border)">support the project</a> &nbsp;&middot;&nbsp; <a href='""" + REPO_URL + r"""' target="_blank" rel="noopener" style="color:var(--muted);text-decoration:none;border-bottom:1px dotted var(--border)">&#11088; star on GitHub</a></div>
 
 <!-- Add Secret Modal -->
 <div class="modal-overlay" id="add-modal">
