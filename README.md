@@ -287,11 +287,11 @@ We're building in public and we want your input. PX Secrets is part of [PX Open 
 - [x] [One-command installer (`install.sh`)](../../issues/1)
 - [x] [Settings: mask sensitive values (AGE key, key file path)](../../issues/9)
 - [x] [Header icon sizing + star moved to footer](../../issues/8)
+
+**Future**
 - [ ] [Onboarding wizard (first-run setup with key generation)](../../issues/2)
 - [ ] [Self-update from GitHub](../../issues/3)
 - [ ] [Per-secret rotation with safety confirmation](../../issues/5)
-
-**Future**
 - [ ] About dialog with version info
 - [ ] Key rotation support
 - [ ] Homebrew cask (`brew install --cask px-secrets`)
