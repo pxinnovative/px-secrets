@@ -285,7 +285,7 @@ We're building in public and we want your input. PX Secrets is part of [PX Open 
 
 **v1.4.0 — Installer & UI Improvements**
 - [x] [One-command installer (`install.sh`)](../../issues/1)
-- [ ] [Settings: mask sensitive values (AGE key, key file path)](../../issues/9)
+- [x] [Settings: mask sensitive values (AGE key, key file path)](../../issues/9)
 - [x] [Header icon sizing + star moved to footer](../../issues/8)
 - [ ] [Onboarding wizard (first-run setup with key generation)](../../issues/2)
 - [ ] [Self-update from GitHub](../../issues/3)

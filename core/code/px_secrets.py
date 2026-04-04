@@ -29,7 +29,7 @@ from flask import Flask, jsonify, request
 # ---------------------------------------------------------------------------
 
 APP_NAME = "PX Secrets"
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 REPO_URL = "https://github.com/pxinnovative/px-secrets"
 SUPPORT_URL = "https://buymeacoffee.com/pxinnovative"
 
@@ -495,6 +495,7 @@ h1{font-size:22px;font-weight:600;color:var(--accent)}
 .modal input:focus,.modal textarea:focus{border-color:var(--accent)}
 .modal textarea{resize:vertical;min-height:90px}
 .modal-actions{display:flex;gap:8px;margin-top:14px;justify-content:flex-end}
+.masked-field{display:flex;align-items:center;gap:4px}.masked-field input{flex:1;min-width:0}.masked-btn{background:none;border:none;color:var(--muted);font-size:15px;cursor:pointer;padding:2px 4px;line-height:1;transition:color .15s}.masked-btn:hover{color:var(--text)}
 /* Toast */
 .toast-container{position:fixed;bottom:16px;right:16px;z-index:200;display:flex;flex-direction:column;gap:6px}
 .toast{background:rgba(102,187,106,0.15);color:var(--success);border:1px solid rgba(102,187,106,0.3);padding:10px 20px;border-radius:10px;font-size:13px;opacity:0;transform:translateY(10px);transition:all .3s;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);pointer-events:none}
@@ -579,9 +580,17 @@ h1{font-size:22px;font-weight:600;color:var(--accent)}
     <label>Vault File Path</label>
     <input id="set-vault">
     <label>AGE Key File</label>
-    <input id="set-keyfile">
+    <div class="masked-field">
+      <input id="set-keyfile" type="password" autocomplete="off">
+      <button class="masked-btn" onclick="copyMasked('set-keyfile')" title="Copy">&#128203;</button>
+      <button class="masked-btn" onclick="toggleMasked('set-keyfile','eye-keyfile')" title="Show/hide" id="eye-keyfile">&#128065;</button>
+    </div>
     <label>AGE Public Key</label>
-    <input id="set-pubkey">
+    <div class="masked-field">
+      <input id="set-pubkey" type="password" autocomplete="off">
+      <button class="masked-btn" onclick="copyMasked('set-pubkey')" title="Copy">&#128203;</button>
+      <button class="masked-btn" onclick="toggleMasked('set-pubkey','eye-pubkey')" title="Show/hide" id="eye-pubkey">&#128065;</button>
+    </div>
     <div class="modal-actions">
       <button class="btn" onclick="closeModal('settings-modal')">Cancel</button>
       <button class="btn btn-accent" onclick="saveSettings()">Save</button>
@@ -843,8 +852,12 @@ async function saveNote() {
 function showSettingsModal() {
   fetch('/api/settings').then(r=>r.json()).then(d => {
     document.getElementById('set-vault').value = d.vault_path || '';
-    document.getElementById('set-keyfile').value = d.age_key_file || '';
-    document.getElementById('set-pubkey').value = d.age_public_key || '';
+    const kf = document.getElementById('set-keyfile');
+    const pk = document.getElementById('set-pubkey');
+    kf.value = d.age_key_file || '';
+    pk.value = d.age_public_key || '';
+    kf.type = 'password'; document.getElementById('eye-keyfile').style.color = '';
+    pk.type = 'password'; document.getElementById('eye-pubkey').style.color = '';
     document.getElementById('settings-modal').classList.add('show');
   });
 }
@@ -864,6 +877,20 @@ async function saveSettings() {
 }
 
 function closeModal(id) { document.getElementById(id).classList.remove('show'); }
+
+function copyMasked(inputId) {
+  const val = document.getElementById(inputId).value;
+  if (!val) { toast('Nothing to copy'); return; }
+  navigator.clipboard.writeText(val).then(() => toast('Copied \u2014 will clear in 30s'));
+  setTimeout(() => navigator.clipboard.writeText(''), 30000);
+}
+
+function toggleMasked(inputId, eyeId) {
+  const el = document.getElementById(inputId);
+  const btn = document.getElementById(eyeId);
+  if (el.type === 'password') { el.type = 'text'; btn.style.color = 'var(--accent)'; }
+  else { el.type = 'password'; btn.style.color = ''; }
+}
 
 function toast(msg) {
   const c = document.getElementById('toasts');
