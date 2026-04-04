@@ -519,7 +519,7 @@ h1{font-size:22px;font-weight:600;color:var(--accent)}
   <small>v""" + VERSION + r"""</small>
   <small style="color:var(--muted)">SOPS + AGE</small>
   <div class="header-icons">
-    <a class="icon-btn" onclick="showSettingsModal()" title="Settings" style="font-size:16px">&#9881;</a>
+    <a class="icon-btn" onclick="showSettingsModal()" title="Settings">&#9881;&#65039;</a>
     <a class="icon-btn" onclick="fetch('/api/open-browser')" title="Open in browser">&#127760;</a>
   </div>
 </div>
