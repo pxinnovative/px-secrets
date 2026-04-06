@@ -289,16 +289,17 @@ We're building in public and we want your input. PX Secrets is part of [PX Open 
 - [x] [Settings: mask sensitive values (AGE key, key file path)](../../issues/9)
 - [x] [Header icon sizing + star moved to footer](../../issues/8)
 
-**v1.4.1 — macOS Native Identity**
+**v1.4.1 — macOS Native Identity & About Dialog**
 - [x] [macOS app identity — process name, menu bar, Activity Monitor](../../issues/10)
 - [x] [Dock icon hidden in headless mode](../../issues/10)
+- [x] About dialog with version, runtime, and system info
+- [x] Keyboard shortcuts (Cmd+K search, Escape close, Cmd+N add)
 
 **Future**
 - [ ] [Native macOS .app bundle with custom icon (Phase 2)](../../issues/10)
 - [ ] [Onboarding wizard (first-run setup with key generation)](../../issues/2)
 - [ ] [Self-update from GitHub](../../issues/3)
 - [ ] [Per-secret rotation with safety confirmation](../../issues/5)
-- [ ] About dialog with version info
 - [ ] Key rotation support
 - [ ] Homebrew cask (`brew install --cask px-secrets`)
 
