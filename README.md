@@ -47,6 +47,7 @@ PX Secrets fills the gap between "I keep my secrets in `.env` files" and "I need
 - **Notes per secret** — Attach context to any key (expiration dates, rotation info, etc.).
 - **Settings UI** — Configure vault path, AGE key file, and public key from the GUI.
 - **Headless mode** — Run as a background server for automation and LaunchAgents.
+- **macOS native identity** — Shows as "PX Secrets" in Activity Monitor and menu bar; Dock icon hidden in headless mode.
 - **Single file** — One Python file, no build step, no complex setup.
 - **Privacy by design** — No telemetry, no analytics, no network calls. Ever.
 
@@ -288,7 +289,12 @@ We're building in public and we want your input. PX Secrets is part of [PX Open 
 - [x] [Settings: mask sensitive values (AGE key, key file path)](../../issues/9)
 - [x] [Header icon sizing + star moved to footer](../../issues/8)
 
+**v1.4.1 — macOS Native Identity**
+- [x] [macOS app identity — process name, menu bar, Activity Monitor](../../issues/10)
+- [x] [Dock icon hidden in headless mode](../../issues/10)
+
 **Future**
+- [ ] [Native macOS .app bundle with custom icon (Phase 2)](../../issues/10)
 - [ ] [Onboarding wizard (first-run setup with key generation)](../../issues/2)
 - [ ] [Self-update from GitHub](../../issues/3)
 - [ ] [Per-secret rotation with safety confirmation](../../issues/5)
