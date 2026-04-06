@@ -1095,6 +1095,28 @@ async function showAboutModal() {
   } catch(e) { el.textContent = 'Error loading info'; }
 }
 
+// Keyboard shortcuts
+document.addEventListener('keydown', function(e) {
+  // Escape — close any open modal
+  if (e.key === 'Escape') {
+    document.querySelectorAll('.modal-overlay.show').forEach(m => m.classList.remove('show'));
+    return;
+  }
+  // Cmd/Ctrl+K — focus search
+  if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+    e.preventDefault();
+    document.getElementById('search').focus();
+    return;
+  }
+  // Cmd/Ctrl+N — add secret
+  if ((e.metaKey || e.ctrlKey) && e.key === 'n') {
+    if (!document.querySelector('.modal-overlay.show')) {
+      e.preventDefault();
+      showAddModal();
+    }
+  }
+});
+
 loadVault();
 </script>
 </body>
