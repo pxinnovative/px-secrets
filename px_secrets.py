@@ -479,6 +479,22 @@ def api_import():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/about")
+def api_about():
+    """Return version, runtime, and system information."""
+    import platform
+
+    return jsonify({
+        "app": APP_NAME,
+        "version": VERSION,
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "arch": platform.machine(),
+        "repo": REPO_URL,
+        "license": "AGPL-3.0",
+    })
+
+
 # ---------------------------------------------------------------------------
 # Embedded HTML/CSS/JS
 # ---------------------------------------------------------------------------
@@ -568,6 +584,7 @@ h1{font-size:22px;font-weight:600;color:var(--accent)}
   <small>v""" + VERSION + r"""</small>
   <small style="color:var(--muted)">SOPS + AGE</small>
   <div class="header-icons">
+    <a class="icon-btn" onclick="showAboutModal()" title="About">&#8505;&#65039;</a>
     <a class="icon-btn" onclick="showSettingsModal()" title="Settings">&#9881;&#65039;</a>
     <a class="icon-btn" onclick="fetch('/api/open-browser')" title="Open in browser">&#127760;</a>
   </div>
@@ -709,6 +726,19 @@ h1{font-size:22px;font-weight:600;color:var(--accent)}
     <div class="modal-actions">
       <button class="btn" onclick="closeModal('export-modal')">Cancel</button>
       <button class="btn btn-accent" onclick="doExport()">Download</button>
+    </div>
+  </div>
+</div>
+
+<!-- About Modal -->
+<div class="modal-overlay" id="about-modal">
+  <div class="modal">
+    <h2>About</h2>
+    <div id="about-content" style="font-size:13px;line-height:1.8">Loading...</div>
+    <div class="modal-actions" style="margin-top:16px">
+      <a class="btn" href='""" + REPO_URL + r"""' target="_blank" rel="noopener">GitHub</a>
+      <a class="btn" href='""" + SUPPORT_URL + r"""' target="_blank" rel="noopener">&hearts; Support</a>
+      <button class="btn btn-accent" onclick="closeModal('about-modal')">Close</button>
     </div>
   </div>
 </div>
@@ -1040,6 +1070,29 @@ function doExport() {
   const fmt = document.getElementById('export-format').value;
   closeModal('export-modal');
   window.open('/api/export?format=' + fmt, '_blank');
+}
+
+async function showAboutModal() {
+  const el = document.getElementById('about-content');
+  el.textContent = 'Loading...';
+  document.getElementById('about-modal').classList.add('show');
+  try {
+    const r = await fetch('/api/about');
+    const d = await r.json();
+    el.innerHTML = `
+      <div style="display:grid;grid-template-columns:auto 1fr;gap:4px 12px">
+        <span style="color:var(--muted)">App</span><span style="color:var(--accent);font-weight:600">${d.app}</span>
+        <span style="color:var(--muted)">Version</span><span>${d.version}</span>
+        <span style="color:var(--muted)">License</span><span>${d.license}</span>
+        <span style="color:var(--muted)">Python</span><span class="mono">${d.python}</span>
+        <span style="color:var(--muted)">Platform</span><span class="mono" style="font-size:12px">${d.platform}</span>
+        <span style="color:var(--muted)">Arch</span><span class="mono">${d.arch}</span>
+      </div>
+      <p style="margin-top:12px;color:var(--muted);font-size:12px">
+        No telemetry. No cloud. No network calls.<br>
+        Your secrets stay on your machine, period.
+      </p>`;
+  } catch(e) { el.textContent = 'Error loading info'; }
 }
 
 loadVault();
