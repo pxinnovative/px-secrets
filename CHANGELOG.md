@@ -6,6 +6,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Versions follow [Semant
 
 ---
 
+## [1.4.1] — 2026-04-05
+
+### Added
+- **macOS app identity** — process shows as "PX Secrets" in Activity Monitor and menu bar instead of "Python" ([#10](../../issues/10) Phase 1)
+- **Dock icon hidden in headless mode** — background server no longer shows Python rocket icon in macOS Dock ([#10](../../issues/10) Phase 1)
+
+### Technical
+- Uses PyObjC (`NSProcessInfo`, `NSBundle`, `NSApplication`) — ships with macOS system Python, no extra install
+- Gracefully skips on Linux or if PyObjC is unavailable
+
+---
+
 ## [1.4.0] — 2026-04-04
 
 ### Added
@@ -46,6 +58,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Versions follow [Semant
 
 ---
 
+[1.4.1]: https://github.com/pxinnovative/px-secrets/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/pxinnovative/px-secrets/releases/tag/v1.4.0
 [1.3.0]: https://github.com/pxinnovative/px-secrets/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/pxinnovative/px-secrets/releases/tag/v1.2.0

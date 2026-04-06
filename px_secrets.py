@@ -25,11 +25,60 @@ import yaml
 from flask import Flask, jsonify, request
 
 # ---------------------------------------------------------------------------
+# macOS App Identity (Phase 1 of Issue #10)
+# ---------------------------------------------------------------------------
+
+
+def _configure_macos_identity(headless=False):
+    """Set proper app name and optionally hide Dock icon on macOS.
+
+    Uses PyObjC (ships with macOS system Python) to:
+    - Set the process name to APP_NAME in Activity Monitor
+    - Hide the Dock icon when running in headless/server mode
+
+    Silently skips on Linux or if PyObjC is unavailable.
+    """
+    if sys.platform != "darwin":
+        return
+
+    try:
+        from Foundation import NSBundle, NSProcessInfo  # type: ignore
+        from AppKit import NSApplication, NSApplicationActivationPolicyProhibited, NSApplicationActivationPolicyRegular  # type: ignore  # noqa: E501
+
+        # Set process name for Activity Monitor / ps output
+        NSProcessInfo.processInfo().setProcessName_(APP_NAME)
+
+        # Override the bundle name so macOS menu bar shows "PX Secrets"
+        # instead of "Python". This works by patching the main bundle's
+        # Info.plist in memory — does not modify any files on disk.
+        bundle = NSBundle.mainBundle()
+        info = bundle.localizedInfoDictionary() or bundle.infoDictionary()
+        if info is not None:
+            info["CFBundleName"] = APP_NAME
+            info["CFBundleDisplayName"] = APP_NAME
+
+        if headless:
+            # Hide Dock icon — headless mode should be invisible
+            ns_app = NSApplication.sharedApplication()
+            ns_app.setActivationPolicy_(NSApplicationActivationPolicyProhibited)
+        else:
+            # Ensure Dock icon is visible in GUI modes
+            ns_app = NSApplication.sharedApplication()
+            ns_app.setActivationPolicy_(NSApplicationActivationPolicyRegular)
+
+    except ImportError:
+        # PyObjC not available — skip silently
+        pass
+    except Exception:
+        # Don't let app identity setup crash the actual server
+        pass
+
+# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 APP_NAME = "PX Secrets"
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 REPO_URL = "https://github.com/pxinnovative/px-secrets"
 SUPPORT_URL = "https://buymeacoffee.com/pxinnovative"
 
@@ -1079,6 +1128,9 @@ def main():
 
     # Store port in app config so /api/open-browser can read it
     app.config["port"] = port
+
+    # Configure macOS app identity (process name, Dock visibility)
+    _configure_macos_identity(headless=args.headless)
 
     if args.native:
         try:

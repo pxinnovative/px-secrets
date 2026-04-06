@@ -7,7 +7,7 @@ for metadata and to support `pip install .` for dependency resolution.
 from setuptools import setup
 
 APP_NAME = "PX Secrets"
-VERSION = "1.2.0"
+VERSION = "1.4.1"
 
 setup(
     name="px-secrets",
