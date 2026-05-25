@@ -110,6 +110,45 @@ This tells SOPS which key to use for encryption. Without it, adding secrets will
 
 Click **+ Add**, enter a service name (e.g., `github`), a key name (e.g., `token`), and the secret value. PX Secrets creates an encrypted vault at `~/secrets/vault.enc.yaml`.
 
+## Deploy as a service
+
+PX Secrets can also run headless as a long-lived background service — useful when scripts, agents, or other tools on the same host need to fetch secrets from the local API without you keeping a desktop session open.
+
+### Run in a container
+
+A `Dockerfile` is included in the repo. Build and run:
+
+```bash
+docker build -t px-secrets:dev .
+
+docker run -d --name px-secrets \
+  -p 127.0.0.1:9999:9999 \
+  -v /path/to/your/vault.enc.yaml:/vault/vault.enc.yaml:ro \
+  -v /path/to/your/age-key:/app/.config/sops/age/keys.txt:ro \
+  -e PX_SECRETS_HOST=0.0.0.0 \
+  -e PX_SECRETS_READ_ONLY=1 \
+  px-secrets:dev
+```
+
+The image carries no secrets — your vault file and AGE key are bind-mounted at runtime. Make sure the AGE key file is mode `0400` on the host so the runtime user (uid `10001`) can read it but nothing else can.
+
+### Environment overrides
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `PX_SECRETS_HOST` | Bind address. Set to `0.0.0.0` inside a container so port mapping works; leave unset on a workstation to keep the listener on localhost. | unset (binds to localhost) |
+| `PX_SECRETS_READ_ONLY` | When set to `1` / `true` / `yes`, the six mutating endpoints (`POST/DELETE /api/secret`, `DELETE /api/service`, `POST /api/note`, `POST /api/settings`, `POST /api/import`) return HTTP 403. Reading endpoints continue to work. Useful for daemon mode. | unset (writes allowed) |
+
+### When to use read-only mode
+
+- **Long-lived daemon** serving secrets to scripts on the same host: enable `PX_SECRETS_READ_ONLY=1`. Do edits from a separate, short-lived interactive session.
+- **Container behind a reverse proxy** with no UI auth: enable read-only at minimum; consider also fronting with an auth gateway since the API has no built-in authentication.
+- **Interactive desktop use**: leave read-only off.
+
+### Security reminder
+
+The local API is unauthenticated by design — its security boundary is the host itself. **Never expose port `9999` outside the local host or a trusted private network.** If you need remote access, front the service with an authentication layer (Authelia, oauth2-proxy, etc.) and a TLS-terminating reverse proxy.
+
 ## Usage
 
 ### GUI (default)
