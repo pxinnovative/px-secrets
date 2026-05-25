@@ -78,7 +78,7 @@ def _configure_macos_identity(headless=False):
 # ---------------------------------------------------------------------------
 
 APP_NAME = "PX Secrets"
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 REPO_URL = "https://github.com/pxinnovative/px-secrets"
 SUPPORT_URL = "https://buymeacoffee.com/pxinnovative"
 GITHUB_API_BASE = "https://api.github.com/repos/pxinnovative/px-secrets"
@@ -267,6 +267,31 @@ def _resolve_service_case(service: str, data: dict) -> str:
 def index():
     """Serve the single-page UI."""
     return HTML_PAGE
+
+
+@app.route("/healthz")
+def healthz():
+    """Liveness probe — deliberately outside the /api/ prefix so the bearer-token
+    guard exempts it. Returns 200 if the process is alive; does not touch the
+    vault. Use this from Kubernetes / systemd liveness probes when
+    PX_SECRETS_AUTH_TOKEN is set, otherwise the probe would 401 and the
+    supervisor would kill a healthy pod.
+    """
+    return jsonify({"status": "ok", "version": VERSION})
+
+
+@app.route("/readyz")
+def readyz():
+    """Readiness probe — exercises the full SOPS+AGE decrypt chain so a 200
+    means everything the pod needs (vault mount, AGE key, sops binary, yaml
+    parser) is wired up correctly. Returns 500 with the failure reason
+    otherwise. Also auth-exempt by virtue of being outside /api/.
+    """
+    try:
+        decrypt_vault()
+        return jsonify({"status": "ready"})
+    except Exception as e:
+        return jsonify({"status": "not-ready", "error": str(e)}), 500
 
 
 @app.route("/api/vault")
