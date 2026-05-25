@@ -211,6 +211,26 @@ def _readonly_guard():
     return None
 
 
+def _resolve_service_case(service: str, data: dict) -> str:
+    """Return the canonical service key for case-insensitive match.
+
+    If `service` matches an existing top-level key case-insensitively, return the
+    existing key's exact casing so the new write lands in the same bucket. If no
+    match exists, return `service` unchanged so the user-typed case is preserved.
+
+    Prevents the duplicate-by-case bug where typing "test" while "Test" already
+    exists creates two separate entries that look identical in the UI (CSS
+    uppercases the display).
+    """
+    if service in data:
+        return service
+    lower = service.lower()
+    for existing in data:
+        if existing.lower() == lower:
+            return existing
+    return service
+
+
 @app.route("/")
 def index():
     """Serve the single-page UI."""
@@ -240,7 +260,7 @@ def api_add_secret():
         return guard
     try:
         body = request.json
-        service = body["service"]
+        service = body["service"].strip()
         key = body["key"]
         value = body["value"]
         note = body.get("note", "")
@@ -250,6 +270,7 @@ def api_add_secret():
         )
 
         data = decrypt_vault()
+        service = _resolve_service_case(service, data)
         if not overwrite and service in data and key in data[service]:
             return jsonify({
                 "error": "Key already exists. Resend with overwrite=true to replace.",
@@ -275,9 +296,10 @@ def api_delete_secret():
         return guard
     try:
         body = request.json
-        service = body["service"]
+        service = body["service"].strip()
         key = body["key"]
         data = decrypt_vault()
+        service = _resolve_service_case(service, data)
         if service in data:
             data[service].pop(key, None)
             data[service].pop(f"{key}__note", None)
@@ -297,6 +319,7 @@ def api_delete_service(svc):
         return guard
     try:
         data = decrypt_vault()
+        svc = _resolve_service_case(svc.strip(), data)
         if svc in data:
             del data[svc]
         encrypt_vault(data)
@@ -313,10 +336,11 @@ def api_add_note():
         return guard
     try:
         body = request.json
-        service = body["service"]
+        service = body["service"].strip()
         key = body["key"]
         note = body["note"]
         data = decrypt_vault()
+        service = _resolve_service_case(service, data)
         if service not in data:
             return jsonify({"error": "Service not found"}), 404
         if note:
@@ -468,7 +492,7 @@ def api_import():
         body = request.json
         text = body.get("text", "")
         fmt = body.get("format", "auto")
-        service = body.get("service", "")
+        service = body.get("service", "").strip()
 
         imported = {}
 
@@ -510,6 +534,7 @@ def api_import():
         for svc, keys in imported.items():
             if not isinstance(keys, dict):
                 continue
+            svc = _resolve_service_case(svc.strip(), data)
             if svc not in data:
                 data[svc] = {}
             for k, v in keys.items():
