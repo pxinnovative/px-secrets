@@ -355,6 +355,9 @@ We're building in public and we want your input. PX Secrets is part of [PX Open 
 **v1.6.1 — Auth-exempt health endpoints**
 - [x] Adds `/healthz` (liveness) and `/readyz` (readiness, exercises the SOPS+AGE decrypt chain) outside the `/api/` prefix so Kubernetes / systemd probes don't 401 when `PX_SECRETS_AUTH_TOKEN` is set
 
+**v1.6.2 — Dockerfile no longer hard-codes read-only mode**
+- [x] `PX_SECRETS_READ_ONLY` removed as a Dockerfile `ENV` default — security policy is a deployment concern, not an image concern. Writable is the default; pass `-e PX_SECRETS_READ_ONLY=1` (or set in the K8s manifest) when you want a read-only sidecar. Previously the bake-in made it impossible to deploy a writable pod without an explicit override-to-empty in every manifest.
+
 **Future**
 
 *Data model & UX*

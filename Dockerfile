@@ -37,8 +37,16 @@ WORKDIR ${APP_HOME}
 COPY --chown=pxs:pxs px_secrets.py ${APP_HOME}/px_secrets.py
 
 ENV PX_SECRETS_HOST=0.0.0.0 \
-    PX_SECRETS_READ_ONLY=1 \
     PYTHONUNBUFFERED=1
+
+# Note: PX_SECRETS_READ_ONLY is deliberately NOT set here. Security policy
+# (read-only vs. read-write) is a deployment-layer concern, not an image
+# concern. Set `-e PX_SECRETS_READ_ONLY=1` at `docker run` / K8s manifest
+# level for a read-only sidecar; leave unset for writable. Setting it as
+# a Dockerfile default would make it impossible to deploy a writable pod
+# without explicitly overriding to empty in the manifest — a footgun for
+# Olares-as-source-of-truth deployments where the pod IS the authoritative
+# writer.
 
 EXPOSE 9999
 

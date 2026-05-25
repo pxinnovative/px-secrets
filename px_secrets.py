@@ -78,7 +78,7 @@ def _configure_macos_identity(headless=False):
 # ---------------------------------------------------------------------------
 
 APP_NAME = "PX Secrets"
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 REPO_URL = "https://github.com/pxinnovative/px-secrets"
 SUPPORT_URL = "https://buymeacoffee.com/pxinnovative"
 GITHUB_API_BASE = "https://api.github.com/repos/pxinnovative/px-secrets"
