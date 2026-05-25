@@ -138,6 +138,7 @@ The image carries no secrets — your vault file and AGE key are bind-mounted at
 |---|---|---|
 | `PX_SECRETS_HOST` | Bind address. Set to `0.0.0.0` inside a container so port mapping works; leave unset on a workstation to keep the listener on localhost. | unset (binds to localhost) |
 | `PX_SECRETS_READ_ONLY` | When set to `1` / `true` / `yes`, the six mutating endpoints (`POST/DELETE /api/secret`, `DELETE /api/service`, `POST /api/note`, `POST /api/settings`, `POST /api/import`) return HTTP 403. Reading endpoints continue to work. Useful for daemon mode. | unset (writes allowed) |
+| `PX_SECRETS_AUTH_TOKEN` | When set, every request to `/api/*` must include `Authorization: Bearer <token>` (constant-time compared). Useful for multi-process hosts where you want a non-human caller (script, agent, sidecar) to authenticate against the API on the same loopback port. The UI prompts for the token on the first 401 and caches it in `sessionStorage` for the rest of the tab. | unset (open API on loopback) |
 
 ### When to use read-only mode
 
@@ -147,7 +148,10 @@ The image carries no secrets — your vault file and AGE key are bind-mounted at
 
 ### Security reminder
 
-The local API is unauthenticated by design — its security boundary is the host itself. **Never expose port `9999` outside the local host or a trusted private network.** If you need remote access, front the service with an authentication layer (Authelia, oauth2-proxy, etc.) and a TLS-terminating reverse proxy.
+The local API is **unauthenticated by default** — its security boundary is the host itself. **Never expose port `9999` outside the local host or a trusted private network without authentication.** Two options for hardening:
+
+1. Set `PX_SECRETS_AUTH_TOKEN` (see env table above) so every `/api/*` request must carry a matching `Authorization: Bearer` header. Suitable for multi-process hosts where you trust the host but not every process on it.
+2. For internet exposure, front with an authentication gateway (Authelia, oauth2-proxy) plus a TLS-terminating reverse proxy. The bearer token can stack on top so the API rejects requests even if the gateway is bypassed.
 
 ## Usage
 
@@ -343,6 +347,10 @@ We're building in public and we want your input. PX Secrets is part of [PX Open 
 **v1.5.1 — Data integrity and UI honesty**
 - [x] [Case-insensitive service dedup on add/delete/note/import](../../issues/24)
 - [x] Service names render with their stored casing — the UI no longer force-uppercases display, so what you see in the list matches exactly what was saved
+
+**v1.6.0 — Foundation: self-update + API auth**
+- [x] [Self-update from the GitHub Releases API](../../issues/3) — `Check for updates` button in the About dialog, single-file replacement, backup-on-rollback, process restart via LaunchAgent / systemd `KeepAlive`
+- [x] [Bearer token authentication for `/api/*` via `PX_SECRETS_AUTH_TOKEN`](../../issues/17) — unblocks safe API exposure for non-human callers on multi-process hosts; UI prompts on 401 and caches the token in sessionStorage
 
 **Future**
 

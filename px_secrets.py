@@ -78,9 +78,11 @@ def _configure_macos_identity(headless=False):
 # ---------------------------------------------------------------------------
 
 APP_NAME = "PX Secrets"
-VERSION = "1.5.1"
+VERSION = "1.6.0"
 REPO_URL = "https://github.com/pxinnovative/px-secrets"
 SUPPORT_URL = "https://buymeacoffee.com/pxinnovative"
+GITHUB_API_BASE = "https://api.github.com/repos/pxinnovative/px-secrets"
+GITHUB_RAW_BASE = "https://raw.githubusercontent.com/pxinnovative/px-secrets"
 
 # Network
 DEFAULT_HOST = "127.0.0.1"
@@ -89,8 +91,10 @@ DEFAULT_PORT = 9999
 # Environment overrides for container deployment.
 # Set PX_SECRETS_HOST=0.0.0.0 to bind all interfaces (e.g. for container port mapping).
 # Set PX_SECRETS_READ_ONLY=1 to disable mutating endpoints (vault read-only mode).
+# Set PX_SECRETS_AUTH_TOKEN=<token> to require Authorization: Bearer <token> on /api/*.
 HOST_OVERRIDE = os.environ.get("PX_SECRETS_HOST")
 READ_ONLY = os.environ.get("PX_SECRETS_READ_ONLY", "").lower() in ("1", "true", "yes")
+AUTH_TOKEN = os.environ.get("PX_SECRETS_AUTH_TOKEN", "")
 
 # Native window dimensions (pywebview)
 NATIVE_WINDOW_WIDTH = 750
@@ -208,6 +212,34 @@ def _readonly_guard():
     """
     if READ_ONLY:
         return jsonify({"error": "Vault is read-only (PX_SECRETS_READ_ONLY=1)"}), 403
+    return None
+
+
+@app.before_request
+def _bearer_auth_guard():
+    """Optional bearer token authentication for the JSON API.
+
+    Off by default for backward compat with single-user desktop deployments.
+    When PX_SECRETS_AUTH_TOKEN is set in the environment, every request to
+    /api/* must include `Authorization: Bearer <token>` matching the env value
+    (constant-time compared). Requests outside /api/* — the UI shell, static
+    assets — are not gated, so a browser visit still works and the UI can
+    prompt for the token in JavaScript.
+
+    Designed for multi-process hosts where a non-human caller (script, agent,
+    sidecar container) needs to talk to the API but you don't want a free-for-
+    all on the loopback port. Tracking issue: #17.
+    """
+    if not AUTH_TOKEN:
+        return None
+    if not request.path.startswith("/api/"):
+        return None
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return jsonify({"error": "Authorization Bearer token required"}), 401
+    provided = auth_header[7:].strip()
+    if not secrets.compare_digest(provided, AUTH_TOKEN):
+        return jsonify({"error": "Invalid token"}), 401
     return None
 
 
@@ -567,7 +599,151 @@ def api_about():
         "arch": platform.machine(),
         "repo": REPO_URL,
         "license": "AGPL-3.0",
+        "auth_required": bool(AUTH_TOKEN),
+        "read_only": READ_ONLY,
     })
+
+
+def _version_tuple(v: str) -> tuple:
+    """Convert 'v1.6.0' or '1.6.0' to (1, 6, 0) for comparison.
+
+    Non-numeric or malformed parts collapse to 0 so pre-release tags like
+    '1.6.0-rc1' don't crash the comparison. Returns an empty tuple on total
+    parse failure so callers see a 'no update' verdict by default.
+    """
+    try:
+        cleaned = v.lstrip("v").split("-")[0].split("+")[0]
+        return tuple(int(p) for p in cleaned.split("."))
+    except (ValueError, AttributeError):
+        return ()
+
+
+@app.route("/api/check-update")
+def api_check_update():
+    """Check the GitHub Releases API for a newer published version.
+
+    Read-only, network-touching, no auth required to GitHub (anonymous rate
+    limit is plenty for occasional checks). Returns current vs. latest plus a
+    boolean verdict so the UI can render a single 'Update available' badge
+    without doing its own version math. Tracking issue: #3.
+    """
+    import urllib.request
+    import urllib.error
+    try:
+        req = urllib.request.Request(
+            f"{GITHUB_API_BASE}/releases/latest",
+            headers={
+                "User-Agent": f"px-secrets/{VERSION}",
+                "Accept": "application/vnd.github+json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            release = json.loads(response.read())
+        latest = release.get("tag_name", "").lstrip("v")
+        has_update = _version_tuple(latest) > _version_tuple(VERSION)
+        return jsonify({
+            "current": VERSION,
+            "latest": latest,
+            "has_update": has_update,
+            "release_url": release.get("html_url", ""),
+            "release_name": release.get("name", ""),
+            "release_notes": (release.get("body") or "")[:2000],
+            "published_at": release.get("published_at", ""),
+        })
+    except urllib.error.URLError as e:
+        return jsonify({"error": f"Network error: {e.reason}"}), 502
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/apply-update", methods=["POST"])
+def api_apply_update():
+    """Download the latest px_secrets.py from the published release tag and replace this file.
+
+    Single-file replacement only — the OSS distribution is intentionally one
+    Python file precisely so updates can be atomic. After write, the process
+    exits with code 0 so a supervising LaunchAgent / systemd unit with
+    KeepAlive restarts it on the new code. Returns the backup path so a
+    rollback is just `mv backup current && restart`.
+
+    Refuses to apply if the downloaded file is suspiciously small or missing
+    the expected sentinels — a safety net against a hijacked CDN serving HTML
+    or a truncated download. Tracking issue: #3.
+
+    Honors PX_SECRETS_READ_ONLY: if the vault is read-only, updates are
+    refused too, on the theory that a sidecar serving a read-only mirror
+    should be deployed by the same pipeline that builds the image, not by
+    pulling code from GitHub at runtime.
+    """
+    guard = _readonly_guard()
+    if guard:
+        return guard
+
+    import urllib.request
+    import urllib.error
+    try:
+        # Resolve the latest tag
+        req = urllib.request.Request(
+            f"{GITHUB_API_BASE}/releases/latest",
+            headers={"User-Agent": f"px-secrets/{VERSION}"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            release = json.loads(response.read())
+        tag = release.get("tag_name", "")
+        if not tag:
+            return jsonify({"error": "Latest release has no tag"}), 500
+        latest = tag.lstrip("v")
+        if not _version_tuple(latest) > _version_tuple(VERSION):
+            return jsonify({
+                "ok": False,
+                "message": "Already on latest version",
+                "current": VERSION,
+                "latest": latest,
+            })
+
+        # Fetch the px_secrets.py at that tag from raw.githubusercontent.com
+        raw_req = urllib.request.Request(
+            f"{GITHUB_RAW_BASE}/{tag}/px_secrets.py",
+            headers={"User-Agent": f"px-secrets/{VERSION}"},
+        )
+        with urllib.request.urlopen(raw_req, timeout=30) as response:
+            new_code = response.read().decode("utf-8")
+
+        # Sanity-check the payload before overwriting ourselves
+        if len(new_code) < 5000:
+            return jsonify({"error": "Downloaded file is suspiciously small"}), 500
+        if "VERSION =" not in new_code or "from flask import" not in new_code:
+            return jsonify({"error": "Downloaded file does not look like px_secrets.py"}), 500
+
+        current_path = os.path.abspath(__file__)
+        backup_path = f"{current_path}.bak-v{VERSION}"
+        with open(current_path, "rb") as src, open(backup_path, "wb") as dst:
+            dst.write(src.read())
+
+        with open(current_path, "w") as f:
+            f.write(new_code)
+
+        # Restart by exiting — LaunchAgent / systemd with KeepAlive brings us back
+        # on the new code. Run the exit on a delayed daemon thread so the HTTP
+        # response gets flushed to the caller first.
+        def _delayed_exit():
+            import time
+            time.sleep(1)
+            os._exit(0)
+
+        threading.Thread(target=_delayed_exit, daemon=True).start()
+
+        return jsonify({
+            "ok": True,
+            "from": VERSION,
+            "to": latest,
+            "backup": backup_path,
+            "message": "Update written. Restarting process — reload the page in ~3 seconds.",
+        })
+    except urllib.error.URLError as e:
+        return jsonify({"error": f"Network error: {e.reason}"}), 502
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ---------------------------------------------------------------------------
@@ -826,6 +1002,35 @@ const TOAST_DURATION_MS = """ + str(TOAST_DURATION_MS) + r""";
 
 let vaultData = {};
 let revealedKeys = {};
+
+// Bearer token wrapper — inject Authorization header for /api/* if the server requires
+// auth (set via PX_SECRETS_AUTH_TOKEN env). On a 401 the user is prompted once; the
+// token is then cached in sessionStorage for the rest of the tab's lifetime so it
+// doesn't follow the user across browser restarts.
+(function(){
+  const _origFetch = window.fetch;
+  window.fetch = function(url, options){
+    const u = typeof url === 'string' ? url : (url && url.url);
+    if (u && u.startsWith('/api/')) {
+      const token = sessionStorage.getItem('px_secrets_token');
+      if (token) {
+        options = options || {};
+        options.headers = Object.assign({}, options.headers || {}, {'Authorization': 'Bearer ' + token});
+      }
+    }
+    return _origFetch.call(this, url, options).then(function(resp){
+      if (resp.status === 401 && u && u.startsWith('/api/')) {
+        sessionStorage.removeItem('px_secrets_token');
+        const token = prompt('API authentication required. Paste your PX_SECRETS_AUTH_TOKEN:');
+        if (token) {
+          sessionStorage.setItem('px_secrets_token', token.trim());
+          location.reload();
+        }
+      }
+      return resp;
+    });
+  };
+})();
 let openCards = new Set();
 
 async function loadVault() {
@@ -1154,9 +1359,11 @@ async function showAboutModal() {
   try {
     const r = await fetch('/api/about');
     const d = await r.json();
+    const authBadge = d.auth_required ? '<span style="color:var(--accent);font-size:11px">&#128274; auth required</span>' : '';
+    const roBadge = d.read_only ? '<span style="color:var(--muted);font-size:11px">read-only</span>' : '';
     el.innerHTML = `
       <div style="display:grid;grid-template-columns:auto 1fr;gap:4px 12px">
-        <span style="color:var(--muted)">App</span><span style="color:var(--accent);font-weight:600">${d.app}</span>
+        <span style="color:var(--muted)">App</span><span style="color:var(--accent);font-weight:600">${d.app} ${authBadge} ${roBadge}</span>
         <span style="color:var(--muted)">Version</span><span>${d.version}</span>
         <span style="color:var(--muted)">License</span><span>${d.license}</span>
         <span style="color:var(--muted)">Python</span><span class="mono">${d.python}</span>
@@ -1166,8 +1373,61 @@ async function showAboutModal() {
       <p style="margin-top:12px;color:var(--muted);font-size:12px">
         No telemetry. No cloud. No network calls.<br>
         Your secrets stay on your machine, period.
-      </p>`;
+      </p>
+      <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border)">
+        <button class="btn btn-accent" onclick="checkForUpdates()">Check for updates</button>
+        <div id="update-status" style="margin-top:8px;font-size:12px;color:var(--muted)"></div>
+      </div>`;
   } catch(e) { el.textContent = 'Error loading info'; }
+}
+
+async function checkForUpdates() {
+  const status = document.getElementById('update-status');
+  status.style.color = 'var(--muted)';
+  status.textContent = 'Checking GitHub...';
+  try {
+    const r = await fetch('/api/check-update');
+    const d = await r.json();
+    if (d.error) {
+      status.style.color = '#e88';
+      status.textContent = 'Error: ' + d.error;
+      return;
+    }
+    if (d.has_update) {
+      status.style.color = 'var(--accent)';
+      status.innerHTML = `<strong>Update available:</strong> v${d.current} &rarr; v${d.latest}<br>
+        <a href="${d.release_url}" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:underline">Release notes</a><br>
+        <button class="btn btn-accent" style="margin-top:8px" onclick="applyUpdate('${d.latest}')">Update now</button>`;
+    } else {
+      status.style.color = 'var(--muted)';
+      status.textContent = 'You are on the latest version (v' + d.current + ').';
+    }
+  } catch(e) {
+    status.style.color = '#e88';
+    status.textContent = 'Failed: ' + e.message;
+  }
+}
+
+async function applyUpdate(toVersion) {
+  if (!confirm('Replace this app with v' + toVersion + '? The server will restart and the page will reload automatically.')) return;
+  const status = document.getElementById('update-status');
+  status.style.color = 'var(--muted)';
+  status.textContent = 'Downloading and applying...';
+  try {
+    const r = await fetch('/api/apply-update', {method:'POST'});
+    const d = await r.json();
+    if (d.ok) {
+      status.style.color = 'var(--accent)';
+      status.innerHTML = '<strong>Updated to v' + d.to + '.</strong> Restarting server...<br>Backup at: <span class="mono" style="font-size:11px">' + d.backup + '</span><br><em>Reloading in 3 seconds.</em>';
+      setTimeout(function(){ location.reload(); }, 3500);
+    } else {
+      status.style.color = '#e88';
+      status.textContent = 'Error: ' + (d.error || d.message || 'Unknown failure');
+    }
+  } catch(e) {
+    status.style.color = '#e88';
+    status.textContent = 'Failed: ' + e.message;
+  }
 }
 
 // Keyboard shortcuts
