@@ -334,12 +334,31 @@ We're building in public and we want your input. PX Secrets is part of [PX Open 
 - [x] About dialog with version, runtime, and system info
 - [x] Keyboard shortcuts (Cmd+K search, Escape close, Cmd+N add)
 
+**v1.5.0 — Headless / Container deployment** *(in [PR #23](../../pull/23))*
+- [ ] [Official Docker image with PX_SECRETS_HOST env](../../issues/14)
+- [ ] [Read-only mode via PX_SECRETS_READ_ONLY](../../issues/15)
+- [ ] [Deploy-as-a-service README section](../../issues/16)
+- [ ] [Refuse silent overwrite of existing secrets](../../issues/11)
+
 **Future**
+
+*Data model & UX*
+- [ ] [Nested secrets with multiple fields, multi-account services, ordered sequences](../../issues/18)
+- [ ] [Typed secrets with filter, sort, and selective import/export per type](../../issues/20)
+- [ ] [Inline edit for key_name, value, and new key_type field](../../issues/12)
+- [ ] [Multiple named vaults with per-vault access control](../../issues/21)
+
+*Security & key management*
+- [ ] [AGE key custody flow at onboarding + key rotation support](../../issues/22)
+- [ ] [Optional UI unlock layer (Touch ID / Face ID / password) with auto-lock on idle](../../issues/19)
+- [ ] [Per-secret rotation with safety confirmation](../../issues/5)
+- [ ] [2FA backup codes (TOTP recovery codes)](../../issues/13)
+- [ ] [Bearer token for multi-process hosts (discussion)](../../issues/17)
+
+*Platform & distribution*
 - [ ] [Native macOS .app bundle with custom icon (Phase 2)](../../issues/10)
 - [ ] [Onboarding wizard (first-run setup with key generation)](../../issues/2)
 - [ ] [Self-update from GitHub](../../issues/3)
-- [ ] [Per-secret rotation with safety confirmation](../../issues/5)
-- [ ] Key rotation support
 - [ ] Homebrew cask (`brew install --cask px-secrets`)
 
 See [Issues](../../issues) for the full list.
