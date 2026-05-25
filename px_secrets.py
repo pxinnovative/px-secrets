@@ -78,7 +78,7 @@ def _configure_macos_identity(headless=False):
 # ---------------------------------------------------------------------------
 
 APP_NAME = "PX Secrets"
-VERSION = "1.4.1"
+VERSION = "1.5.1"
 REPO_URL = "https://github.com/pxinnovative/px-secrets"
 SUPPORT_URL = "https://buymeacoffee.com/pxinnovative"
 
@@ -607,7 +607,7 @@ h1{font-size:22px;font-weight:600;color:var(--accent)}
 .card-header:hover{background:#2a2a2a}
 .arrow{color:var(--muted);font-size:10px;transition:transform .2s;width:12px;text-align:center}
 .arrow.open{transform:rotate(90deg)}
-.svc-name{color:var(--accent);font-weight:600;font-size:15px;text-transform:uppercase;letter-spacing:.5px}
+.svc-name{color:var(--accent);font-weight:600;font-size:15px}
 .key-count{color:var(--muted);font-size:13px;margin-left:auto}
 .card-body{display:none;padding:4px 12px 10px}
 .card-body.open{display:block}
