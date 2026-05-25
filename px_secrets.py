@@ -86,6 +86,12 @@ SUPPORT_URL = "https://buymeacoffee.com/pxinnovative"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 9999
 
+# Environment overrides for container deployment.
+# Set PX_SECRETS_HOST=0.0.0.0 to bind all interfaces (e.g. for container port mapping).
+# Set PX_SECRETS_READ_ONLY=1 to disable mutating endpoints (vault read-only mode).
+HOST_OVERRIDE = os.environ.get("PX_SECRETS_HOST")
+READ_ONLY = os.environ.get("PX_SECRETS_READ_ONLY", "").lower() in ("1", "true", "yes")
+
 # Native window dimensions (pywebview)
 NATIVE_WINDOW_WIDTH = 750
 NATIVE_WINDOW_HEIGHT = 850
@@ -194,6 +200,17 @@ def encrypt_vault(data: dict):
 app = Flask(__name__)
 
 
+def _readonly_guard():
+    """Return a 403 response tuple if PX_SECRETS_READ_ONLY env is set.
+
+    Mutating endpoints call this at entry; if the env flag is on, the request
+    is rejected before touching the vault. Returns None when writes are allowed.
+    """
+    if READ_ONLY:
+        return jsonify({"error": "Vault is read-only (PX_SECRETS_READ_ONLY=1)"}), 403
+    return None
+
+
 @app.route("/")
 def index():
     """Serve the single-page UI."""
@@ -212,15 +229,33 @@ def api_vault():
 
 @app.route("/api/secret", methods=["POST"])
 def api_add_secret():
-    """Add or update a secret in the vault."""
+    """Add or update a secret in the vault.
+
+    Refuses to overwrite an existing key unless the caller explicitly opts in
+    via `overwrite=true` (body field or query param). Silent overwrites are a
+    data-loss footgun for non-rotatable credentials like long-lived API keys.
+    """
+    guard = _readonly_guard()
+    if guard:
+        return guard
     try:
         body = request.json
         service = body["service"]
         key = body["key"]
         value = body["value"]
         note = body.get("note", "")
+        overwrite = (
+            body.get("overwrite") is True
+            or request.args.get("overwrite", "").lower() in ("1", "true", "yes")
+        )
 
         data = decrypt_vault()
+        if not overwrite and service in data and key in data[service]:
+            return jsonify({
+                "error": "Key already exists. Resend with overwrite=true to replace.",
+                "service": service,
+                "key": key,
+            }), 409
         if service not in data:
             data[service] = {}
         data[service][key] = value
@@ -235,6 +270,9 @@ def api_add_secret():
 @app.route("/api/secret", methods=["DELETE"])
 def api_delete_secret():
     """Delete a single secret (and its note) from the vault."""
+    guard = _readonly_guard()
+    if guard:
+        return guard
     try:
         body = request.json
         service = body["service"]
@@ -254,6 +292,9 @@ def api_delete_secret():
 @app.route("/api/service/<svc>", methods=["DELETE"])
 def api_delete_service(svc):
     """Delete an entire service and all its secrets from the vault."""
+    guard = _readonly_guard()
+    if guard:
+        return guard
     try:
         data = decrypt_vault()
         if svc in data:
@@ -267,6 +308,9 @@ def api_delete_service(svc):
 @app.route("/api/note", methods=["POST"])
 def api_add_note():
     """Add or update a note attached to a secret."""
+    guard = _readonly_guard()
+    if guard:
+        return guard
     try:
         body = request.json
         service = body["service"]
@@ -298,6 +342,9 @@ def api_get_settings():
 @app.route("/api/settings", methods=["POST"])
 def api_save_settings():
     """Save new vault and key configuration."""
+    guard = _readonly_guard()
+    if guard:
+        return guard
     try:
         body = request.json
         cfg = {
@@ -414,6 +461,9 @@ def api_export():
 @app.route("/api/import", methods=["POST"])
 def api_import():
     """Import secrets from .env, JSON, or YAML format."""
+    guard = _readonly_guard()
+    if guard:
+        return guard
     try:
         body = request.json
         text = body.get("text", "")
@@ -1198,7 +1248,7 @@ def main():
         return
 
     # GUI mode
-    host = DEFAULT_HOST
+    host = HOST_OVERRIDE or DEFAULT_HOST
     port = args.port
 
     # Store port in app config so /api/open-browser can read it
