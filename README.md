@@ -352,6 +352,9 @@ We're building in public and we want your input. PX Secrets is part of [PX Open 
 - [x] [Self-update from the GitHub Releases API](../../issues/3) — `Check for updates` button in the About dialog, single-file replacement, backup-on-rollback, process restart via LaunchAgent / systemd `KeepAlive`
 - [x] [Bearer token authentication for `/api/*` via `PX_SECRETS_AUTH_TOKEN`](../../issues/17) — unblocks safe API exposure for non-human callers on multi-process hosts; UI prompts on 401 and caches the token in sessionStorage
 
+**v1.6.1 — Auth-exempt health endpoints**
+- [x] Adds `/healthz` (liveness) and `/readyz` (readiness, exercises the SOPS+AGE decrypt chain) outside the `/api/` prefix so Kubernetes / systemd probes don't 401 when `PX_SECRETS_AUTH_TOKEN` is set
+
 **Future**
 
 *Data model & UX*
