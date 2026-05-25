@@ -334,11 +334,14 @@ We're building in public and we want your input. PX Secrets is part of [PX Open 
 - [x] About dialog with version, runtime, and system info
 - [x] Keyboard shortcuts (Cmd+K search, Escape close, Cmd+N add)
 
-**v1.5.0 — Headless / Container deployment** *(in [PR #23](../../pull/23))*
-- [ ] [Official Docker image with PX_SECRETS_HOST env](../../issues/14)
-- [ ] [Read-only mode via PX_SECRETS_READ_ONLY](../../issues/15)
-- [ ] [Deploy-as-a-service README section](../../issues/16)
-- [ ] [Refuse silent overwrite of existing secrets](../../issues/11)
+**v1.5.0 — Headless / Container deployment** *(merged, release pending)*
+- [x] [Official Docker image with PX_SECRETS_HOST env](../../issues/14)
+- [x] [Read-only mode via PX_SECRETS_READ_ONLY](../../issues/15)
+- [x] [Deploy-as-a-service README section](../../issues/16)
+- [x] [Refuse silent overwrite of existing secrets](../../issues/11)
+
+**v1.5.1 — Data integrity fixes** *(merged, release pending)*
+- [x] [Case-insensitive service dedup on add/delete/note/import](../../issues/24)
 
 **Future**
 
