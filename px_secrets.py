@@ -987,6 +987,14 @@ h1{font-size:22px;font-weight:600;color:var(--accent)}
 .key-actions{display:flex;gap:4px;flex-shrink:0}
 .key-note{color:var(--muted);font-style:italic;font-size:12px;margin-top:8px;padding-left:0;cursor:pointer;transition:color .15s}
 .key-note:hover{color:var(--accent)}
+.key-group{margin:4px 0;border-left:2px solid #333;padding-left:8px}
+.key-group-head{display:flex;align-items:center;gap:8px;padding:6px 0;cursor:pointer;user-select:none}
+.key-group-head:hover .group-name{color:var(--accent)}
+.group-name{font-weight:600;font-size:14px;color:#ddd}
+.group-desc{color:var(--muted);font-style:italic;font-size:12px;margin:0 0 4px 20px}
+.key-group-body{display:none;padding-left:12px}
+.key-group-body.open{display:block}
+.ro-tag{color:var(--muted);font-size:11px;font-style:italic;align-self:center;padding:0 4px;border:1px solid #333;border-radius:4px}
 .status-bar{margin-top:12px;color:var(--muted);font-size:13px;text-align:center}
 .cli-ref{margin-top:4px;color:var(--muted);font-size:11px;text-align:center}
 /* Modals */
@@ -1252,6 +1260,7 @@ let revealedKeys = {};
   };
 })();
 let openCards = new Set();
+let openGroups = new Set();
 
 // ---- App lock (issue #19): master-password gate + idle auto-lock ----
 let _lockMode = 'unlock';
@@ -1347,77 +1356,158 @@ async function loadVault() {
   } catch(e) { toast('Failed to load vault'); }
 }
 
-function render() {
-  const q = document.getElementById('search').value.toLowerCase();
-  const container = document.getElementById('cards');
-  container.innerHTML = '';
-  let svcCount = 0, keyCount = 0;
-  const services = Object.keys(vaultData).sort();
-  for (const svc of services) {
-    const keys = Object.keys(vaultData[svc]).filter(k => !k.endsWith('__note'));
-    const filteredKeys = keys.filter(k => {
-      if (!q) return true;
-      return svc.toLowerCase().includes(q) || k.toLowerCase().includes(q);
-    });
-    if (q && filteredKeys.length === 0 && !svc.toLowerCase().includes(q)) continue;
-    const displayKeys = q ? filteredKeys : keys;
-    svcCount++;
-    keyCount += displayKeys.length;
+function valIsObject(v){ return v !== null && typeof v === 'object' && !Array.isArray(v); }
+// Walk vaultData along an array path [svc, ...keys]. No string parsing, so key
+// names containing the legacy '::' separator can never resolve the wrong node.
+function resolveByPath(path){
+  let cur = vaultData;
+  for (const s of path){ if (cur == null) return undefined; cur = cur[s]; }
+  return cur;
+}
+// Stable, unambiguous UI-state key for a path (arrays of strings serialize 1:1).
+function pkey(path){ return JSON.stringify(path); }
 
-    const card = document.createElement('div');
-    card.className = 'card';
-    const headerId = 'svc-' + svc.replace(/[^a-zA-Z0-9]/g, '_');
-    const isOpen = openCards.has(headerId);
+// Count scalar leaves under obj. 'description' is metadata only when nested (a
+// group caption); at the flat service level (depth 1) it is a normal key.
+function countLeaves(obj, depth){
+  let n = 0;
+  for (const k of Object.keys(obj)){
+    if (k.endsWith('__note')) continue;
+    if (depth > 1 && k === 'description') continue;
+    if (valIsObject(obj[k])) n += countLeaves(obj[k], depth + 1); else n += 1;
+  }
+  return n;
+}
+// Match a query against key names + description/note TEXT only — never against
+// secret values (matching values would silently reveal whether a value contains q).
+function groupMatches(obj, q){
+  for (const k of Object.keys(obj)){
+    if (k.toLowerCase().includes(q)) return true;
+    const v = obj[k];
+    if (valIsObject(v)){ if (groupMatches(v, q)) return true; }
+    else if (typeof v === 'string' && (k === 'description' || k.endsWith('__note')) && v.toLowerCase().includes(q)) return true;
+  }
+  return false;
+}
 
-    let headerHTML = `<div class="card-header" onclick="toggleCard('${headerId}')">
-      <span class="arrow ${isOpen ? 'open' : ''}" id="arrow-${headerId}">&#9654;</span>
-      <span class="svc-name">${esc(svc)}</span>
-      <span class="key-count">${displayKeys.length} key${displayKeys.length!==1?'s':''}</span>
-      <button class="btn btn-danger btn-sm" onclick="event.stopPropagation();deleteService('${esc(svc)}')">Del</button>
-    </div>`;
+// Per-render registry: integer id -> structured path array. Reset every render().
+// All interactions are wired through ONE delegated click handler that reads the
+// integer data-idx and looks up the path here — NO secret/key/service text is ever
+// interpolated into an onclick / JS-string sink. This removes the HTML-attribute
+// breakout XSS class entirely AND the '::'/gid string-collision hazards.
+let renderPaths = [];
 
-    let bodyHTML = `<div class="card-body ${isOpen ? 'open' : ''}" id="body-${headerId}">`;
-    for (const k of displayKeys) {
-      const noteKey = k + '__note';
-      const note = vaultData[svc][noteKey] || '';
-      const val = vaultData[svc][k];
-      const rid = svc + '::' + k;
-      const shown = revealedKeys[rid];
+// Recursively render an object's entries. pathArr = segments from service to obj.
+// depth 1 = service-level (flat secrets keep full CRUD); depth>1 = nested provider
+// structures, rendered read-only (Show/Copy) — writes stay in SOPS, the source of truth.
+function renderEntries(obj, pathArr, depth){
+  if (depth > 8) return '';  // guard against pathological nesting depth
+  let html = '';
+  // 'description' is the group caption (shown above the rows) only when nested.
+  const keys = Object.keys(obj).filter(k => !k.endsWith('__note') && !(depth > 1 && k === 'description'));
+  for (const k of keys){
+    const val = obj[k];
+    const path = pathArr.concat([k]);
+    const idx = renderPaths.push(path) - 1;
+    if (valIsObject(val)){
+      const childKeys = Object.keys(val).filter(x => !x.endsWith('__note') && x !== 'description');
+      const desc = (typeof val.description === 'string') ? val.description : '';
+      const gOpen = openGroups.has(pkey(path));
+      html += `<div class="key-group">
+        <div class="key-group-head" data-act="group" data-idx="${idx}">
+          <span class="arrow ${gOpen ? 'open' : ''}">&#9654;</span>
+          <span class="group-name">${esc(k)}</span>
+          <span class="key-count">${childKeys.length} field${childKeys.length!==1?'s':''}</span>
+        </div>
+        ${desc ? `<div class="group-desc">${esc(desc)}</div>` : ''}
+        <div class="key-group-body ${gOpen ? 'open' : ''}">
+          ${renderEntries(val, path, depth + 1)}
+        </div>
+      </div>`;
+    } else {
+      const note = obj[k + '__note'] || '';
+      const shown = revealedKeys[pkey(path)];
       const displayVal = shown ? esc(String(val)) : '••••••••';
-      bodyHTML += `<div class="key-row">
+      const isFlat = depth === 1;
+      html += `<div class="key-row">
         <div class="key-top">
           <span class="key-name">${esc(k)}</span>
           <span class="key-value ${shown ? 'revealed' : ''}">${displayVal}</span>
           <span class="key-actions">
-            <button class="btn btn-sm" onclick="event.stopPropagation();toggleReveal('${escAttr(rid)}')">${shown ? 'Hide' : 'Show'}</button>
-            <button class="btn btn-sm" onclick="event.stopPropagation();copyVal('${escAttr(svc)}','${escAttr(k)}')">Copy</button>
-            <button class="btn btn-sm" onclick="event.stopPropagation();showEditModal('${escAttr(svc)}','${escAttr(k)}')">Edit</button>
-            <button class="btn btn-sm" onclick="event.stopPropagation();showNoteModal('${escAttr(svc)}','${escAttr(k)}')">Note</button>
-            <button class="btn btn-danger btn-sm" onclick="event.stopPropagation();deleteKey('${escAttr(svc)}','${escAttr(k)}')">Del</button>
+            <button class="btn btn-sm" data-act="reveal" data-idx="${idx}">${shown ? 'Hide' : 'Show'}</button>
+            <button class="btn btn-sm" data-act="copy" data-idx="${idx}">Copy</button>
+            ${isFlat ? `<button class="btn btn-sm" data-act="edit" data-idx="${idx}">Edit</button>
+            <button class="btn btn-sm" data-act="note" data-idx="${idx}">Note</button>
+            <button class="btn btn-danger btn-sm" data-act="del" data-idx="${idx}">Del</button>` : `<span class="ro-tag" title="Read-only here — edit via SOPS">read-only</span>`}
           </span>
         </div>
-        ${note ? `<div class="key-note" onclick="event.stopPropagation();showNoteModal('${escAttr(svc)}','${escAttr(k)}')">${esc(note)}</div>` : ''}
+        ${note ? `<div class="key-note"${isFlat ? ` data-act="note" data-idx="${idx}"` : ''}>${esc(note)}</div>` : ''}
       </div>`;
     }
+  }
+  return html;
+}
+
+function render() {
+  const q = document.getElementById('search').value.toLowerCase();
+  const container = document.getElementById('cards');
+  container.innerHTML = '';
+  renderPaths = [];
+  let svcCount = 0, keyCount = 0;
+  const services = Object.keys(vaultData).sort();
+  for (const svc of services) {
+    if (q && !svc.toLowerCase().includes(q) && !groupMatches(vaultData[svc], q)) continue;
+    svcCount++;
+    const leaves = countLeaves(vaultData[svc], 1);
+    keyCount += leaves;
+
+    const card = document.createElement('div');
+    card.className = 'card';
+    const cidx = renderPaths.push([svc]) - 1;
+    const isOpen = openCards.has(svc);
+
+    let headerHTML = `<div class="card-header" data-act="card" data-idx="${cidx}">
+      <span class="arrow ${isOpen ? 'open' : ''}">&#9654;</span>
+      <span class="svc-name">${esc(svc)}</span>
+      <span class="key-count">${leaves} key${leaves!==1?'s':''}</span>
+      <button class="btn btn-danger btn-sm" data-act="delsvc" data-idx="${cidx}">Del</button>
+    </div>`;
+
+    let bodyHTML = `<div class="card-body ${isOpen ? 'open' : ''}">`;
+    bodyHTML += renderEntries(vaultData[svc], [svc], 1);
     bodyHTML += '</div>';
     card.innerHTML = headerHTML + bodyHTML;
     container.appendChild(card);
   }
-  document.getElementById('status-bar').textContent = `${svcCount} service${svcCount!==1?'s':''}, ${keyCount} key${keyCount!==1?'s':''} \u2014 encrypted with AGE`;
+  document.getElementById('status-bar').textContent = `${svcCount} service${svcCount!==1?'s':''}, ${keyCount} key${keyCount!==1?'s':''} — encrypted with AGE`;
   updateServiceHints();
 }
 
-function toggleCard(id) {
-  const body = document.getElementById('body-' + id);
-  const arrow = document.getElementById('arrow-' + id);
-  body.classList.toggle('open');
-  arrow.classList.toggle('open');
-  if (openCards.has(id)) openCards.delete(id); else openCards.add(id);
-}
-
-function toggleReveal(rid) {
-  revealedKeys[rid] = !revealedKeys[rid];
-  render();
+// Single delegated handler for every vault interaction. It reads the integer
+// data-idx, looks up the structured path, and dispatches by data-act. Because the
+// handler is bound to the (stable) #cards container, it survives the innerHTML
+// rebuilds that render() performs on each toggle.
+async function onCardsClick(e){
+  const el = e.target.closest('[data-act]');
+  if (!el) return;
+  const act = el.dataset.act;
+  const path = renderPaths[+el.dataset.idx];
+  if (!path) return;
+  if (act === 'card'){ if (openCards.has(path[0])) openCards.delete(path[0]); else openCards.add(path[0]); render(); return; }
+  if (act === 'group'){ const pk = pkey(path); if (openGroups.has(pk)) openGroups.delete(pk); else openGroups.add(pk); render(); return; }
+  if (act === 'reveal'){ const pk = pkey(path); revealedKeys[pk] = !revealedKeys[pk]; render(); return; }
+  if (act === 'copy'){
+    const v = resolveByPath(path);
+    if (v === undefined || valIsObject(v)) { toast('Cannot copy a group'); return; }
+    await navigator.clipboard.writeText(String(v));
+    toast('Copied to clipboard — auto-clears in ' + (CLIPBOARD_CLEAR_MS / 1000) + 's');
+    setTimeout(() => navigator.clipboard.writeText('').catch(()=>{}), CLIPBOARD_CLEAR_MS);
+    return;
+  }
+  if (act === 'edit'){ showEditModal(path[0], path[1]); return; }
+  if (act === 'note'){ showNoteModal(path[0], path[1]); return; }
+  if (act === 'del'){ deleteKey(path[0], path[1]); return; }
+  if (act === 'delsvc'){ deleteService(path[0]); return; }
 }
 
 async function copyVal(svc, key) {
@@ -1432,7 +1522,7 @@ function updateServiceHints() {
   if (!chips) return;
   const services = Object.keys(vaultData).sort();
   chips.innerHTML = services.map(s =>
-    `<span class="svc-chip" onclick="document.getElementById('add-service').value='${esc(s)}'">${esc(s)}</span>`
+    `<span class="svc-chip" onclick="document.getElementById('add-service').value='${escAttr(s)}'">${esc(s)}</span>`
   ).join('');
 }
 
@@ -1591,9 +1681,16 @@ function toast(msg) {
 }
 
 function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
-function escAttr(s) { return s.replace(/\\/g,'\\\\').replace(/'/g,"\\'"); }
+// Escape a value used as a JS string literal inside a DOUBLE-quoted HTML attribute
+// (e.g. onclick="fn('VALUE')"). Two layers: JS-string-escape (\\ and ') FIRST, then
+// HTML-attribute-escape (&, ", <, >) so the value cannot break out of the attribute
+// or the JS string. The browser HTML-decodes the entities back to literals inside the
+// (single-quoted) JS string, where they are harmless. Vault rows no longer use this
+// (they go through data-idx + delegated dispatch); kept for the generator's inline onclick.
+function escAttr(s) { return String(s).replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
 document.getElementById('search').addEventListener('input', render);
+document.getElementById('cards').addEventListener('click', onCardsClick);
 
 // Close modals on overlay click
 document.querySelectorAll('.modal-overlay').forEach(el => {
