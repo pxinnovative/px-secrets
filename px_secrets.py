@@ -8,12 +8,14 @@ All encryption handled by SOPS + AGE on your machine.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import webbrowser
 
 import base64
@@ -22,7 +24,7 @@ import string
 import uuid
 
 import yaml
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, make_response, request
 
 # ---------------------------------------------------------------------------
 # macOS App Identity (Phase 1 of Issue #10)
@@ -78,7 +80,7 @@ def _configure_macos_identity(headless=False):
 # ---------------------------------------------------------------------------
 
 APP_NAME = "PX Secrets"
-VERSION = "1.6.2"
+VERSION = "1.7.0"
 REPO_URL = "https://github.com/pxinnovative/px-secrets"
 SUPPORT_URL = "https://buymeacoffee.com/pxinnovative"
 GITHUB_API_BASE = "https://api.github.com/repos/pxinnovative/px-secrets"
@@ -178,13 +180,20 @@ def encrypt_vault(data: dict):
     if AGE_PUBLIC_KEY:
         env["SOPS_AGE_RECIPIENTS"] = AGE_PUBLIC_KEY
 
-    os.makedirs(os.path.dirname(VAULT_PATH), exist_ok=True)
+    vault_dir = os.path.dirname(VAULT_PATH) or "."
+    os.makedirs(vault_dir, exist_ok=True)
 
-    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as tmp:
-        yaml.dump(data, tmp, default_flow_style=False)
-        tmp_path = tmp.name
-
+    # Write the plaintext temp file in the SAME directory as the vault (not the
+    # system /tmp dir) so that path-scoped .sops.yaml creation_rules — e.g.
+    # `path_regex: secrets/.*\.enc\.yaml$` — still match it. A temp file
+    # under /tmp matches no such rule and `sops encrypt` fails with
+    # "error loading config: no matching creation rules found" (even when AGE
+    # recipients are supplied via flag/env). The temp is created mode 0600 and
+    # removed immediately after encryption.
+    fd, tmp_path = tempfile.mkstemp(prefix=".pxsecrets-tmp-", suffix=".enc.yaml", dir=vault_dir)
     try:
+        with os.fdopen(fd, "w") as tmp:
+            yaml.dump(data, tmp, default_flow_style=False)
         result = subprocess.run(
             ["sops", "encrypt", "--input-type", "yaml", "--output-type", "yaml", tmp_path],
             capture_output=True, text=True, env=env,
@@ -194,7 +203,8 @@ def encrypt_vault(data: dict):
         with open(VAULT_PATH, "w") as f:
             f.write(result.stdout)
     finally:
-        os.unlink(tmp_path)
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -234,13 +244,169 @@ def _bearer_auth_guard():
         return None
     if not request.path.startswith("/api/"):
         return None
+    if request.path in ("/api/lock/status", "/api/session", "/api/lock/setup"):
+        return None
     auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
-        return jsonify({"error": "Authorization Bearer token required"}), 401
-    provided = auth_header[7:].strip()
-    if not secrets.compare_digest(provided, AUTH_TOKEN):
-        return jsonify({"error": "Invalid token"}), 401
-    return None
+    if auth_header.startswith("Bearer ") and secrets.compare_digest(auth_header[7:].strip(), AUTH_TOKEN):
+        return None
+    # A valid UI session (the human unlocked the app lock) also satisfies auth,
+    # so the browser can rely on the session cookie instead of carrying the bearer.
+    if _session_valid(request.cookies.get(SESSION_COOKIE, "")):
+        return None
+    return jsonify({"error": "Authorization Bearer token required"}), 401
+
+
+# ---------------------------------------------------------------------------
+# UI session lock (issue #19) — optional master-password gate + idle auto-lock.
+# A SEPARATE layer from the AGE key and the bearer token: it protects the UI/API
+# against a human at the keyboard with the app already running (lent laptop,
+# unattended desk, shared box). Off until the user sets it up. The master
+# password is scrypt-hashed in ~/.px-secrets/lock.json (mode 0600), never stored
+# or logged in plaintext. Sessions are in-memory tokens with a sliding idle TTL.
+# ---------------------------------------------------------------------------
+
+LOCK_FILE = os.path.join(CONFIG_DIR, "lock.json")
+SESSION_COOKIE = "px_secrets_session"
+DEFAULT_IDLE_TIMEOUT_S = 300
+_SESSIONS = {}  # token -> last-activity epoch seconds
+
+
+def _load_lock():
+    try:
+        with open(LOCK_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _lock_enabled():
+    return bool(_load_lock().get("hash"))
+
+
+def _hash_password(password, salt):
+    return hashlib.scrypt(password.encode("utf-8"), salt=salt, n=16384, r=8, p=1, dklen=32).hex()
+
+
+def _set_master_password(password, idle_timeout_s=DEFAULT_IDLE_TIMEOUT_S):
+    salt = os.urandom(16)
+    cfg = {"version": 1, "salt": salt.hex(), "hash": _hash_password(password, salt),
+           "idle_timeout_s": int(idle_timeout_s)}
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    fd = os.open(LOCK_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def _verify_password(password):
+    cfg = _load_lock()
+    if not cfg.get("hash"):
+        return False
+    return secrets.compare_digest(_hash_password(password, bytes.fromhex(cfg["salt"])), cfg["hash"])
+
+
+def _idle_timeout_s():
+    return int(_load_lock().get("idle_timeout_s", DEFAULT_IDLE_TIMEOUT_S))
+
+
+def _new_session():
+    token = secrets.token_urlsafe(32)
+    _SESSIONS[token] = time.time()
+    return token
+
+
+def _session_valid(token):
+    if not token or token not in _SESSIONS:
+        return False
+    if time.time() - _SESSIONS[token] > _idle_timeout_s():
+        _SESSIONS.pop(token, None)
+        return False
+    _SESSIONS[token] = time.time()  # sliding refresh on activity
+    return True
+
+
+@app.before_request
+def _ui_lock_guard():
+    """Gate /api/* behind the UI session when an app lock is configured.
+
+    Exempt: non-/api/ paths, the lock/session endpoints themselves, and any
+    request bearing a valid PX_SECRETS_AUTH_TOKEN (machine callers authenticate
+    with the bearer token and bypass the human UI lock). Everything else needs a
+    valid, non-idle session cookie established via POST /api/session.
+    """
+    if not _lock_enabled():
+        return None
+    path = request.path
+    if not path.startswith("/api/"):
+        return None
+    if path in ("/api/lock/status", "/api/session", "/api/lock/setup"):
+        return None
+    if AUTH_TOKEN:
+        ah = request.headers.get("Authorization", "")
+        if ah.startswith("Bearer ") and secrets.compare_digest(ah[7:].strip(), AUTH_TOKEN):
+            return None
+    if _session_valid(request.cookies.get(SESSION_COOKIE, "")):
+        return None
+    return jsonify({"error": "locked", "locked": True}), 401
+
+
+@app.route("/api/lock/status")
+def api_lock_status():
+    cfg = _load_lock()
+    enabled = bool(cfg.get("hash"))
+    locked = enabled and not _session_valid(request.cookies.get(SESSION_COOKIE, ""))
+    return jsonify({"enabled": enabled, "locked": locked,
+                    "idle_timeout_s": int(cfg.get("idle_timeout_s", DEFAULT_IDLE_TIMEOUT_S))})
+
+
+@app.route("/api/lock/setup", methods=["POST"])
+def api_lock_setup():
+    guard = _readonly_guard()
+    if guard:
+        return guard
+    body = request.json or {}
+    password = body.get("password", "")
+    if len(password) < 6:
+        return jsonify({"error": "Password must be at least 6 characters"}), 400
+    if _lock_enabled():
+        token = request.cookies.get(SESSION_COOKIE, "")
+        if not _session_valid(token) and not _verify_password(body.get("current_password", "")):
+            return jsonify({"error": "Unlock first, or send current_password to change the lock"}), 401
+    _set_master_password(password, int(body.get("idle_timeout_s", DEFAULT_IDLE_TIMEOUT_S)))
+    resp = make_response(jsonify({"ok": True}))
+    resp.set_cookie(SESSION_COOKIE, _new_session(), httponly=True, samesite="Strict")
+    return resp
+
+
+@app.route("/api/session", methods=["POST"])
+def api_session_create():
+    if not _lock_enabled():
+        return jsonify({"error": "App lock is not configured"}), 400
+    if not _verify_password((request.json or {}).get("password", "")):
+        return jsonify({"error": "Incorrect password"}), 401
+    resp = make_response(jsonify({"ok": True}))
+    resp.set_cookie(SESSION_COOKIE, _new_session(), httponly=True, samesite="Strict")
+    return resp
+
+
+@app.route("/api/session", methods=["DELETE"])
+def api_session_delete():
+    _SESSIONS.pop(request.cookies.get(SESSION_COOKIE, ""), None)
+    resp = make_response(jsonify({"ok": True}))
+    resp.delete_cookie(SESSION_COOKIE)
+    return resp
+
+
+@app.route("/api/lock/disable", methods=["POST"])
+def api_lock_disable():
+    token = request.cookies.get(SESSION_COOKIE, "")
+    if not _session_valid(token) and not _verify_password((request.json or {}).get("password", "")):
+        return jsonify({"error": "Unlock or send password to disable the lock"}), 401
+    try:
+        os.unlink(LOCK_FILE)
+    except FileNotFoundError:
+        pass
+    _SESSIONS.clear()
+    return jsonify({"ok": True})
 
 
 def _resolve_service_case(service: str, data: dict) -> str:
@@ -851,15 +1017,34 @@ h1{font-size:22px;font-weight:600;color:var(--accent)}
 /* Import/Export */
 .import-textarea{width:100%;min-height:150px;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:10px;border-radius:6px;font-family:"SF Mono",monospace;font-size:13px;resize:vertical}
 .format-select{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:6px;font-size:13px}
+#lock-screen{position:fixed;inset:0;background:var(--bg);z-index:10000;display:none;align-items:center;justify-content:center}
+.lock-box{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:32px;width:330px;max-width:90vw;text-align:center;box-shadow:0 12px 48px rgba(0,0,0,.45)}
+.lock-box .lock-emoji{font-size:44px;margin-bottom:6px}
+.lock-box h2{margin:0 0 6px}
+.lock-box input{width:100%;margin:8px 0;padding:11px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:14px}
+.lock-box input:focus{outline:none;border-color:#3b82f6}
 </style>
 </head>
 <body>
+
+<div id="lock-screen">
+  <div class="lock-box">
+    <div class="lock-emoji">&#128274;</div>
+    <h2 id="lock-title">Locked</h2>
+    <p id="lock-sub" style="color:var(--muted);font-size:13px;margin:0 0 10px"></p>
+    <input id="lock-pass" type="password" placeholder="Master password" autocomplete="off" onkeydown="if(event.key==='Enter')lockSubmit()">
+    <input id="lock-pass2" type="password" placeholder="Confirm password" autocomplete="off" style="display:none" onkeydown="if(event.key==='Enter')lockSubmit()">
+    <div id="lock-err" style="color:#e5534b;font-size:12px;min-height:15px;margin:2px 0"></div>
+    <button class="btn btn-accent" style="width:100%" id="lock-btn" onclick="lockSubmit()">Unlock</button>
+  </div>
+</div>
 
 <div class="header">
   <h1>""" + APP_NAME + r"""</h1>
   <small>v""" + VERSION + r"""</small>
   <small style="color:var(--muted)">SOPS + AGE</small>
   <div class="header-icons">
+    <a class="icon-btn" onclick="lockApp()" title="Lock now" id="lock-icon" style="display:none">&#128274;</a>
     <a class="icon-btn" onclick="showAboutModal()" title="About">&#8505;&#65039;</a>
     <a class="icon-btn" onclick="showSettingsModal()" title="Settings">&#9881;&#65039;</a>
     <a class="icon-btn" onclick="fetch('/api/open-browser')" title="Open in browser">&#127760;</a>
@@ -884,7 +1069,7 @@ h1{font-size:22px;font-weight:600;color:var(--accent)}
 <!-- Add Secret Modal -->
 <div class="modal-overlay" id="add-modal">
   <div class="modal">
-    <h2>Add Secret</h2>
+    <h2 id="add-modal-title">Add Secret</h2>
     <label>Service</label>
     <div class="svc-chips" id="svc-chips"></div>
     <input id="add-service" placeholder="New service or click one above" style="margin-top:6px">
@@ -919,6 +1104,15 @@ h1{font-size:22px;font-weight:600;color:var(--accent)}
 <div class="modal-overlay" id="settings-modal">
   <div class="modal">
     <h2>Settings</h2>
+    <div style="border-bottom:1px solid var(--border);padding-bottom:12px;margin-bottom:14px">
+      <label>App Lock</label>
+      <div style="font-size:11px;color:var(--muted);margin:2px 0 8px">Password to open the app + auto-lock when idle. Protects the vault from anyone using this machine. Separate from your AGE key.</div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <button class="btn" id="lock-enable-btn" onclick="closeModal('settings-modal');enableLock()">Enable</button>
+        <button class="btn btn-danger" id="lock-disable-btn" onclick="disableLock()" style="display:none">Disable</button>
+        <span id="lock-state" style="font-size:12px;color:var(--muted)"></span>
+      </div>
+    </div>
     <label>Vault File Path</label>
     <input id="set-vault">
     <label>AGE Key File</label>
@@ -1044,19 +1238,104 @@ let revealedKeys = {};
       }
     }
     return _origFetch.call(this, url, options).then(function(resp){
-      if (resp.status === 401 && u && u.startsWith('/api/')) {
-        sessionStorage.removeItem('px_secrets_token');
-        const token = prompt('API authentication required. Paste your PX_SECRETS_AUTH_TOKEN:');
-        if (token) {
-          sessionStorage.setItem('px_secrets_token', token.trim());
-          location.reload();
-        }
+      if (resp.status === 401 && u && u.startsWith('/api/') && !u.startsWith('/api/session') && !u.startsWith('/api/lock')) {
+        return _origFetch.call(window, '/api/lock/status').then(function(r){return r.json();}).then(function(st){
+          if (st && st.enabled) { if (typeof showLockScreen === 'function') showLockScreen(st, 'unlock'); return resp; }
+          sessionStorage.removeItem('px_secrets_token');
+          const token = prompt('API authentication required. Paste your PX_SECRETS_AUTH_TOKEN:');
+          if (token) { sessionStorage.setItem('px_secrets_token', token.trim()); location.reload(); }
+          return resp;
+        }).catch(function(){ return resp; });
       }
       return resp;
     });
   };
 })();
 let openCards = new Set();
+
+// ---- App lock (issue #19): master-password gate + idle auto-lock ----
+let _lockMode = 'unlock';
+let _idleTimer = null, _idleMs = 300000, _idleBound = false;
+
+async function refreshLockUI(){
+  let st = {enabled:false, locked:false, idle_timeout_s:300};
+  try { st = await (await window.fetch('/api/lock/status')).json(); } catch(e) {}
+  _idleMs = (st.idle_timeout_s || 300) * 1000;
+  const ic = document.getElementById('lock-icon');
+  if (ic) ic.style.display = st.enabled ? '' : 'none';
+  const en = document.getElementById('lock-enable-btn');
+  const dis = document.getElementById('lock-disable-btn');
+  const ls = document.getElementById('lock-state');
+  if (en) en.style.display = st.enabled ? 'none' : '';
+  if (dis) dis.style.display = st.enabled ? '' : 'none';
+  if (ls) ls.textContent = st.enabled ? ('ON — auto-locks after ' + Math.round((st.idle_timeout_s||300)/60) + ' min idle') : 'OFF';
+  return st;
+}
+
+function showLockScreen(st, mode){
+  _lockMode = mode || 'unlock';
+  const setup = _lockMode === 'setup';
+  document.getElementById('lock-title').textContent = setup ? 'Set app lock' : 'Locked';
+  document.getElementById('lock-sub').textContent = setup
+    ? 'Choose a master password (min 6 chars). It opens the app and auto-locks when idle. Separate from your AGE key.'
+    : 'Enter your master password to view the vault.';
+  document.getElementById('lock-pass2').style.display = setup ? '' : 'none';
+  document.getElementById('lock-btn').textContent = setup ? 'Enable lock' : 'Unlock';
+  document.getElementById('lock-err').textContent = '';
+  document.getElementById('lock-pass').value = '';
+  document.getElementById('lock-pass2').value = '';
+  document.getElementById('lock-screen').style.display = 'flex';
+  setTimeout(function(){ document.getElementById('lock-pass').focus(); }, 50);
+}
+
+function hideLockScreen(){ document.getElementById('lock-screen').style.display = 'none'; }
+
+async function lockSubmit(){
+  const pass = document.getElementById('lock-pass').value;
+  const err = document.getElementById('lock-err');
+  if (_lockMode === 'setup'){
+    const pass2 = document.getElementById('lock-pass2').value;
+    if (pass.length < 6){ err.textContent = 'Password must be at least 6 characters'; return; }
+    if (pass !== pass2){ err.textContent = 'Passwords do not match'; return; }
+    const d = await (await fetch('/api/lock/setup', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({password:pass})})).json();
+    if (d.error){ err.textContent = d.error; return; }
+    hideLockScreen(); await refreshLockUI(); startIdleWatch(); toast('App lock enabled'); loadVault();
+  } else {
+    const d = await (await fetch('/api/session', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({password:pass})})).json();
+    if (d.error){ err.textContent = d.error || 'Incorrect password'; return; }
+    hideLockScreen(); startIdleWatch(); loadVault();
+  }
+}
+
+async function lockApp(){
+  try { await fetch('/api/session', {method:'DELETE'}); } catch(e) {}
+  clearTimeout(_idleTimer);
+  showLockScreen({}, 'unlock');
+}
+
+function enableLock(){ showLockScreen({}, 'setup'); }
+
+async function disableLock(){
+  if (!confirm('Disable the app lock? Anyone who opens the app on this machine will see the vault.')) return;
+  const d = await (await fetch('/api/lock/disable', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({})})).json();
+  if (d.error){ toast(d.error); return; }
+  clearTimeout(_idleTimer);
+  await refreshLockUI(); toast('App lock disabled');
+}
+
+function startIdleWatch(){
+  clearTimeout(_idleTimer);
+  const reset = function(){ clearTimeout(_idleTimer); _idleTimer = setTimeout(lockApp, _idleMs); };
+  if (!_idleBound){ ['mousemove','keydown','click','touchstart'].forEach(function(ev){ document.addEventListener(ev, reset, {passive:true}); }); _idleBound = true; }
+  reset();
+}
+
+async function initApp(){
+  const st = await refreshLockUI();
+  if (st.enabled && st.locked){ showLockScreen(st, 'unlock'); return; }
+  if (st.enabled){ startIdleWatch(); }
+  loadVault();
+}
 
 async function loadVault() {
   try {
@@ -1112,6 +1391,7 @@ function render() {
           <span class="key-actions">
             <button class="btn btn-sm" onclick="event.stopPropagation();toggleReveal('${escAttr(rid)}')">${shown ? 'Hide' : 'Show'}</button>
             <button class="btn btn-sm" onclick="event.stopPropagation();copyVal('${escAttr(svc)}','${escAttr(k)}')">Copy</button>
+            <button class="btn btn-sm" onclick="event.stopPropagation();showEditModal('${escAttr(svc)}','${escAttr(k)}')">Edit</button>
             <button class="btn btn-sm" onclick="event.stopPropagation();showNoteModal('${escAttr(svc)}','${escAttr(k)}')">Note</button>
             <button class="btn btn-danger btn-sm" onclick="event.stopPropagation();deleteKey('${escAttr(svc)}','${escAttr(k)}')">Del</button>
           </span>
@@ -1156,14 +1436,36 @@ function updateServiceHints() {
   ).join('');
 }
 
+let editMode = false;
+
 function showAddModal() {
+  editMode = false;
+  document.getElementById('add-modal-title').textContent = 'Add Secret';
   document.getElementById('add-service').value = '';
   document.getElementById('add-key').value = '';
   document.getElementById('add-value').value = '';
   document.getElementById('add-note').value = '';
+  document.getElementById('add-service').readOnly = false;
+  document.getElementById('add-key').readOnly = false;
+  document.getElementById('add-value').placeholder = 'secret value';
   updateServiceHints();
   document.getElementById('add-modal').classList.add('show');
   document.getElementById('add-service').focus();
+}
+
+function showEditModal(svc, key) {
+  editMode = true;
+  document.getElementById('add-modal-title').textContent = 'Edit Secret';
+  document.getElementById('add-service').value = svc;
+  document.getElementById('add-key').value = key;
+  document.getElementById('add-value').value = '';
+  const noteKey = key + '__note';
+  document.getElementById('add-note').value = (vaultData[svc] && vaultData[svc][noteKey]) || '';
+  document.getElementById('add-service').readOnly = true;
+  document.getElementById('add-key').readOnly = true;
+  document.getElementById('add-value').placeholder = 'new value (replaces current)';
+  document.getElementById('add-modal').classList.add('show');
+  document.getElementById('add-value').focus();
 }
 
 async function addSecret() {
@@ -1172,11 +1474,13 @@ async function addSecret() {
   const val = document.getElementById('add-value').value;
   const note = document.getElementById('add-note').value.trim();
   if (!svc || !key || !val) { toast('Service, key, and value are required'); return; }
-  const r = await fetch('/api/secret', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({service:svc,key,value:val,note})});
+  const payload = {service:svc, key, value:val, note};
+  if (editMode) payload.overwrite = true;
+  const r = await fetch('/api/secret', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
   const d = await r.json();
   if (d.error) { toast(d.error); return; }
   closeModal('add-modal');
-  toast('Secret added successfully to vault');
+  toast(editMode ? 'Secret updated in vault' : 'Secret added successfully to vault');
   loadVault();
 }
 
@@ -1477,7 +1781,7 @@ document.addEventListener('keydown', function(e) {
   }
 });
 
-loadVault();
+initApp();
 </script>
 </body>
 </html>"""

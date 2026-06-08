@@ -6,6 +6,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Versions follow [Semant
 
 ---
 
+## [1.7.0] — 2026-06-08
+
+### Added
+- **Inline edit** — every secret now has an **Edit** button to change its value (and note) in place, instead of delete-then-re-add. Service and key are locked during edit; the write only sends `overwrite=true` in this explicit flow, so an accidental Add over an existing key stays protected. ([#12](../../issues/12))
+- **App lock** — optional master-password lock screen with idle auto-lock. Protects the vault against a human at the keyboard with the app already running (lent laptop, unattended desk) — a layer neither the AGE key nor the bearer token covers. Off by default; enable in **Settings → App Lock**. The master password is scrypt-hashed in `~/.px-secrets/lock.json` (mode 0600); sessions are in-memory with a sliding idle timeout (default 5 min). Machine callers with a valid bearer token bypass the UI lock. Password method ships now; biometric (Touch ID / WebAuthn) is a planned follow-up. ([#19](../../issues/19))
+
+### Fixed
+- **Vault writes failed under a path-scoped `.sops.yaml`** — `encrypt_vault` wrote its plaintext temp file to the system temp dir, which matched no `creation_rules` `path_regex`, so `sops encrypt` failed with *"no matching creation rules found"* and the UI could not save any secret. The temp file is now created next to the vault (mode 0600) so it inherits the vault's own SOPS rule and re-encrypts to the configured recipients.
+
 ## [1.4.1] — 2026-04-05
 
 ### Added

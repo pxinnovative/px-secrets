@@ -363,12 +363,12 @@ We're building in public and we want your input. PX Secrets is part of [PX Open 
 *Data model & UX*
 - [ ] [Nested secrets with multiple fields, multi-account services, ordered sequences](../../issues/18)
 - [ ] [Typed secrets with filter, sort, and selective import/export per type](../../issues/20)
-- [ ] [Inline edit for key_name, value, and new key_type field](../../issues/12)
+- [x] [Inline edit for value (and note)](../../issues/12) — shipped v1.7.0 (key_name rename / key_type still open)
 - [ ] [Multiple named vaults with per-vault access control](../../issues/21)
 
 *Security & key management*
 - [ ] [AGE key custody flow at onboarding + key rotation support](../../issues/22)
-- [ ] [Optional UI unlock layer (Touch ID / Face ID / password) with auto-lock on idle](../../issues/19)
+- [x] [Optional UI unlock layer with auto-lock on idle](../../issues/19) — shipped v1.7.0 (master password; Touch ID / WebAuthn still open)
 - [ ] [Per-secret rotation with safety confirmation](../../issues/5)
 - [ ] [2FA backup codes (TOTP recovery codes)](../../issues/13)
 - [ ] [Bearer token for multi-process hosts (discussion)](../../issues/17)
