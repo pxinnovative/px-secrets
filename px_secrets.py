@@ -470,6 +470,56 @@ def api_vault():
         return jsonify({"error": str(e)}), 500
 
 
+def _walk_to_parent(data: dict, path: list, create: bool = False):
+    """Resolve (parent_dict, leaf_key) for a nested path list (e.g.
+    ["telephony", "master", "auth_token"]). With create=True, builds missing
+    intermediate group dicts. Returns (None, leaf) if an intermediate is missing
+    and create=False. Raises ValueError if an intermediate exists but is not a group."""
+    parent = data
+    for seg in path[:-1]:
+        if seg in parent:
+            if not isinstance(parent[seg], dict):
+                raise ValueError(f"path segment '{seg}' is not a group")
+            parent = parent[seg]
+        elif create:
+            parent[seg] = {}
+            parent = parent[seg]
+        else:
+            return None, path[-1]
+    return parent, path[-1]
+
+
+def _prune_empty_groups(data: dict, segments: list):
+    """Delete now-empty group dicts along `segments`, deepest first — so deleting
+    a nested leaf that empties its tenant (and the service) cleans up, matching
+    the flat-delete behavior of removing an emptied service."""
+    for i in range(len(segments), 0, -1):
+        prefix = segments[:i]
+        node = data
+        ok = True
+        for s in prefix:
+            if isinstance(node, dict) and s in node:
+                node = node[s]
+            else:
+                ok = False
+                break
+        if ok and isinstance(node, dict) and not node:
+            par = data
+            for s in prefix[:-1]:
+                par = par[s]
+            par.pop(prefix[-1], None)
+
+
+def _validate_path(path):
+    """Return an error-response tuple if path is not a clean list of non-empty,
+    non-reserved string segments; else None."""
+    if not isinstance(path, list) or len(path) < 1 or not all(isinstance(s, str) and s for s in path):
+        return jsonify({"error": "Invalid path"}), 400
+    if any(s.endswith("__note") for s in path):
+        return jsonify({"error": "Reserved key suffix '__note'"}), 400
+    return None
+
+
 @app.route("/api/secret", methods=["POST"])
 def api_add_secret():
     """Add or update a secret in the vault.
@@ -483,14 +533,33 @@ def api_add_secret():
         return guard
     try:
         body = request.json
-        service = body["service"].strip()
-        key = body["key"]
-        value = body["value"]
-        note = body.get("note", "")
         overwrite = (
             body.get("overwrite") is True
             or request.args.get("overwrite", "").lower() in ("1", "true", "yes")
         )
+        # Nested/path write (e.g. telephony -> tenant -> auth_token). Same vault,
+        # same SOPS-encrypted file as a flat write — just at depth.
+        path = body.get("path")
+        if path is not None:
+            bad = _validate_path(path)
+            if bad:
+                return bad
+            value = body["value"]
+            note = body.get("note", "")
+            data = decrypt_vault()
+            parent, leaf = _walk_to_parent(data, path, create=True)
+            if not overwrite and leaf in parent:
+                return jsonify({"error": "Key already exists. Resend with overwrite=true to replace.", "path": path}), 409
+            parent[leaf] = value
+            if note:
+                parent[f"{leaf}__note"] = note
+            encrypt_vault(data)
+            return jsonify({"ok": True})
+
+        service = body["service"].strip()
+        key = body["key"]
+        value = body["value"]
+        note = body.get("note", "")
 
         data = decrypt_vault()
         service = _resolve_service_case(service, data)
@@ -519,9 +588,22 @@ def api_delete_secret():
         return guard
     try:
         body = request.json
+        data = decrypt_vault()
+        path = body.get("path")
+        if path is not None:
+            bad = _validate_path(path)
+            if bad:
+                return bad
+            parent, leaf = _walk_to_parent(data, path, create=False)
+            if parent is not None:
+                parent.pop(leaf, None)
+                parent.pop(f"{leaf}__note", None)
+                _prune_empty_groups(data, path[:-1])
+            encrypt_vault(data)
+            return jsonify({"ok": True})
+
         service = body["service"].strip()
         key = body["key"]
-        data = decrypt_vault()
         service = _resolve_service_case(service, data)
         if service in data:
             data[service].pop(key, None)
@@ -559,10 +641,25 @@ def api_add_note():
         return guard
     try:
         body = request.json
-        service = body["service"].strip()
-        key = body["key"]
         note = body["note"]
         data = decrypt_vault()
+        path = body.get("path")
+        if path is not None:
+            bad = _validate_path(path)
+            if bad:
+                return bad
+            parent, leaf = _walk_to_parent(data, path, create=False)
+            if parent is None:
+                return jsonify({"error": "Path not found"}), 404
+            if note:
+                parent[f"{leaf}__note"] = note
+            else:
+                parent.pop(f"{leaf}__note", None)
+            encrypt_vault(data)
+            return jsonify({"ok": True})
+
+        service = body["service"].strip()
+        key = body["key"]
         service = _resolve_service_case(service, data)
         if service not in data:
             return jsonify({"error": "Service not found"}), 404
@@ -1428,7 +1525,6 @@ function renderEntries(obj, pathArr, depth){
       const note = obj[k + '__note'] || '';
       const shown = revealedKeys[pkey(path)];
       const displayVal = shown ? esc(String(val)) : '••••••••';
-      const isFlat = depth === 1;
       html += `<div class="key-row">
         <div class="key-top">
           <span class="key-name">${esc(k)}</span>
@@ -1436,12 +1532,12 @@ function renderEntries(obj, pathArr, depth){
           <span class="key-actions">
             <button class="btn btn-sm" data-act="reveal" data-idx="${idx}">${shown ? 'Hide' : 'Show'}</button>
             <button class="btn btn-sm" data-act="copy" data-idx="${idx}">Copy</button>
-            ${isFlat ? `<button class="btn btn-sm" data-act="edit" data-idx="${idx}">Edit</button>
+            <button class="btn btn-sm" data-act="edit" data-idx="${idx}">Edit</button>
             <button class="btn btn-sm" data-act="note" data-idx="${idx}">Note</button>
-            <button class="btn btn-danger btn-sm" data-act="del" data-idx="${idx}">Del</button>` : `<span class="ro-tag" title="Read-only here — edit via SOPS">read-only</span>`}
+            <button class="btn btn-danger btn-sm" data-act="del" data-idx="${idx}">Del</button>
           </span>
         </div>
-        ${note ? `<div class="key-note"${isFlat ? ` data-act="note" data-idx="${idx}"` : ''}>${esc(note)}</div>` : ''}
+        ${note ? `<div class="key-note" data-act="note" data-idx="${idx}">${esc(note)}</div>` : ''}
       </div>`;
     }
   }
@@ -1504,9 +1600,9 @@ async function onCardsClick(e){
     setTimeout(() => navigator.clipboard.writeText('').catch(()=>{}), CLIPBOARD_CLEAR_MS);
     return;
   }
-  if (act === 'edit'){ showEditModal(path[0], path[1]); return; }
-  if (act === 'note'){ showNoteModal(path[0], path[1]); return; }
-  if (act === 'del'){ deleteKey(path[0], path[1]); return; }
+  if (act === 'edit'){ showEditModal(path); return; }
+  if (act === 'note'){ showNoteModal(path); return; }
+  if (act === 'del'){ deleteKey(path); return; }
   if (act === 'delsvc'){ deleteService(path[0]); return; }
 }
 
@@ -1527,9 +1623,18 @@ function updateServiceHints() {
 }
 
 let editMode = false;
+let editPath = null;   // full path array of the secret being edited (flat or nested)
+let notePath = null;   // full path array for the note modal
+// Resolve the existing note text for a leaf path: parent[leaf + '__note'].
+function noteAt(path){
+  const parent = resolveByPath(path.slice(0, -1));
+  const leaf = path[path.length - 1];
+  return (parent && parent[leaf + '__note']) || '';
+}
 
 function showAddModal() {
   editMode = false;
+  editPath = null;
   document.getElementById('add-modal-title').textContent = 'Add Secret';
   document.getElementById('add-service').value = '';
   document.getElementById('add-key').value = '';
@@ -1543,14 +1648,16 @@ function showAddModal() {
   document.getElementById('add-service').focus();
 }
 
-function showEditModal(svc, key) {
+function showEditModal(path) {
   editMode = true;
+  editPath = path;
   document.getElementById('add-modal-title').textContent = 'Edit Secret';
-  document.getElementById('add-service').value = svc;
-  document.getElementById('add-key').value = key;
+  // Location is read-only (edit value/note only). For nested paths the parent
+  // chain is shown as "service / tenant" and the leaf key separately.
+  document.getElementById('add-service').value = path.slice(0, -1).join(' / ');
+  document.getElementById('add-key').value = path[path.length - 1];
   document.getElementById('add-value').value = '';
-  const noteKey = key + '__note';
-  document.getElementById('add-note').value = (vaultData[svc] && vaultData[svc][noteKey]) || '';
+  document.getElementById('add-note').value = noteAt(path);
   document.getElementById('add-service').readOnly = true;
   document.getElementById('add-key').readOnly = true;
   document.getElementById('add-value').placeholder = 'new value (replaces current)';
@@ -1559,13 +1666,18 @@ function showEditModal(svc, key) {
 }
 
 async function addSecret() {
-  const svc = document.getElementById('add-service').value.trim();
-  const key = document.getElementById('add-key').value.trim();
   const val = document.getElementById('add-value').value;
   const note = document.getElementById('add-note').value.trim();
-  if (!svc || !key || !val) { toast('Service, key, and value are required'); return; }
-  const payload = {service:svc, key, value:val, note};
-  if (editMode) payload.overwrite = true;
+  let payload;
+  if (editMode && editPath) {
+    if (!val) { toast('A new value is required'); return; }
+    payload = {path: editPath, value: val, note, overwrite: true};
+  } else {
+    const svc = document.getElementById('add-service').value.trim();
+    const key = document.getElementById('add-key').value.trim();
+    if (!svc || !key || !val) { toast('Service, key, and value are required'); return; }
+    payload = {service: svc, key, value: val, note};
+  }
   const r = await fetch('/api/secret', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
   const d = await r.json();
   if (d.error) { toast(d.error); return; }
@@ -1587,10 +1699,10 @@ function showConfirm(msg) {
   });
 }
 
-async function deleteKey(svc, key) {
-  const ok = await showConfirm(`Delete ${svc}.${key}?`);
+async function deleteKey(path) {
+  const ok = await showConfirm(`Delete ${path.join(' / ')}?`);
   if (!ok) return;
-  const r = await fetch('/api/secret', {method:'DELETE', headers:{'Content-Type':'application/json'}, body:JSON.stringify({service:svc,key})});
+  const r = await fetch('/api/secret', {method:'DELETE', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path})});
   const d = await r.json();
   if (d.error) { toast(d.error); return; }
   toast('Secret deleted successfully');
@@ -1607,19 +1719,16 @@ async function deleteService(svc) {
   loadVault();
 }
 
-function showNoteModal(svc, key) {
-  document.getElementById('note-service').value = svc;
-  document.getElementById('note-key').value = key;
-  const noteKey = key + '__note';
-  document.getElementById('note-text').value = (vaultData[svc] && vaultData[svc][noteKey]) || '';
+function showNoteModal(path) {
+  notePath = path;
+  document.getElementById('note-text').value = noteAt(path);
   document.getElementById('note-modal').classList.add('show');
 }
 
 async function saveNote() {
-  const svc = document.getElementById('note-service').value;
-  const key = document.getElementById('note-key').value;
+  if (!notePath) { toast('No secret selected'); return; }
   const note = document.getElementById('note-text').value.trim();
-  const r = await fetch('/api/note', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({service:svc,key,note})});
+  const r = await fetch('/api/note', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path: notePath, note})});
   const d = await r.json();
   if (d.error) { toast(d.error); return; }
   closeModal('note-modal');
