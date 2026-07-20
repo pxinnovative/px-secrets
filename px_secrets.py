@@ -26,6 +26,8 @@ import uuid
 import yaml
 from flask import Flask, jsonify, make_response, request
 
+import px_vaults  # multi-vault layer (Issue #21)
+
 # ---------------------------------------------------------------------------
 # macOS App Identity (Phase 1 of Issue #10)
 # ---------------------------------------------------------------------------
@@ -153,13 +155,39 @@ def save_config(cfg: dict):
 
 load_config()
 
+# Multi-vault (Issue #21): on first run, seed a "Default" vault from the legacy single file (by COPY;
+# the original is left intact). No-op once any vault exists or if no recipient is configured.
+if AGE_PUBLIC_KEY:
+    try:
+        px_vaults.migrate_legacy(VAULT_PATH, [AGE_PUBLIC_KEY])
+    except Exception:
+        pass
+
 # ---------------------------------------------------------------------------
 # SOPS helpers
 # ---------------------------------------------------------------------------
 
 
+def _active_vault_id():
+    """Resolve which vault the current request targets: the `X-Vault` header or `?vault=` param,
+    else the default. Returns None when no vaults exist yet (legacy single-file mode)."""
+    from flask import has_request_context
+    vaults = px_vaults.list_vaults()
+    if not vaults:
+        return None
+    ids = {v["id"] for v in vaults}
+    if has_request_context():
+        sel = request.headers.get("X-Vault") or request.args.get("vault")
+        if sel and sel in ids:
+            return sel
+    return "default" if "default" in ids else vaults[0]["id"]
+
+
 def decrypt_vault() -> dict:
-    """Decrypt the SOPS vault and return its contents as a dict."""
+    """Decrypt the active vault (multi-vault) or the legacy single file, return its contents."""
+    vid = _active_vault_id()
+    if vid is not None:
+        return px_vaults.decrypt(vid, AGE_KEY_FILE)
     if not os.path.exists(VAULT_PATH):
         return {}
     env = os.environ.copy()
@@ -174,7 +202,11 @@ def decrypt_vault() -> dict:
 
 
 def encrypt_vault(data: dict):
-    """Encrypt data and write it to the SOPS vault file."""
+    """Encrypt data to the active vault (multi-vault) or the legacy single file."""
+    vid = _active_vault_id()
+    if vid is not None:
+        px_vaults.encrypt(vid, data, AGE_KEY_FILE)
+        return
     env = os.environ.copy()
     env["SOPS_AGE_KEY_FILE"] = AGE_KEY_FILE
     if AGE_PUBLIC_KEY:
@@ -462,12 +494,81 @@ def readyz():
 
 @app.route("/api/vault")
 def api_vault():
-    """Return all secrets grouped by service."""
+    """Return all secrets grouped by service (of the active vault)."""
     try:
         data = decrypt_vault()
         return jsonify(data)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/vaults", methods=["GET"])
+def api_list_vaults():
+    """List named vaults (Issue #21). Each: id, name, agent_access, human_unlock_required."""
+    return jsonify({"vaults": px_vaults.list_vaults()})
+
+
+@app.route("/api/vaults", methods=["POST"])
+def api_create_vault():
+    """Create a named vault with its own recipients + access policy."""
+    guard = _readonly_guard()
+    if guard:
+        return guard
+    body = request.get_json(force=True, silent=True) or {}
+    name = (body.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "name required"}), 400
+    recipients = body.get("recipients") or ([AGE_PUBLIC_KEY] if AGE_PUBLIC_KEY else [])
+    try:
+        vid = px_vaults.create_vault(
+            name, recipients,
+            agent_access=body.get("agent_access", "read_write"),
+            human_unlock_required=bool(body.get("human_unlock_required", False)),
+        )
+    except (ValueError, FileExistsError) as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"ok": True, "id": vid}), 201
+
+
+@app.route("/api/vaults/move", methods=["POST"])
+def api_move_secret():
+    """Move or copy a secret between vaults (Issue #31). Body: src, dst, path[], copy?, dry_run?."""
+    guard = _readonly_guard()
+    if guard:
+        return guard
+    b = request.get_json(force=True, silent=True) or {}
+    src, dst, path = b.get("src"), b.get("dst"), b.get("path")
+    if not (src and dst and isinstance(path, list) and path):
+        return jsonify({"error": "src, dst, path[] required"}), 400
+    try:
+        res = px_vaults.move_secret(src, dst, path, AGE_KEY_FILE,
+                                    copy=bool(b.get("copy")), dry_run=bool(b.get("dry_run")))
+    except KeyError as e:
+        return jsonify({"error": f"not found: {e}"}), 404
+    except (ValueError, FileExistsError) as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"ok": True, "result": res})
+
+
+@app.before_request
+def _vault_policy_guard():
+    """Enforce per-vault agent_access for automation (Bearer) callers on vault-data routes.
+    Humans / the local UI are unrestricted here (still subject to the UI lock). Policy:
+    read_write = full, read = GET/HEAD only, deny = blocked. Legacy single-file mode = no policy."""
+    p = request.path
+    if not (p == "/api/vault" or p.startswith("/api/secret") or p.startswith("/api/note")):
+        return None
+    vid = _active_vault_id()
+    if vid is None:
+        return None
+    if not request.headers.get("Authorization", "").startswith("Bearer "):
+        return None  # not an agent bearer call — treat as human/local
+    policy = px_vaults.read_config(vid).get("agent_access", "read_write")
+    if policy == "read_write" or (policy == "read" and request.method in ("GET", "HEAD")):
+        return None
+    return jsonify({"error": f"vault '{vid}' denies agent {request.method} (agent_access={policy})"}), 403
 
 
 def _walk_to_parent(data: dict, path: list, create: bool = False):
@@ -1157,6 +1258,8 @@ h1{font-size:22px;font-weight:600;color:var(--accent)}
 </div>
 
 <div class="toolbar">
+  <select id="vault-switcher" onchange="switchVault(this.value)" title="Active vault" style="display:none"></select>
+  <button class="btn" onclick="createVaultPrompt()" title="Create a new vault">+ Vault</button>
   <input type="text" id="search" placeholder="Search services or keys...">
   <button class="btn btn-accent" onclick="showAddModal()">+ Add</button>
   <button class="btn" onclick="loadVault()">Refresh</button>
@@ -1436,16 +1539,51 @@ function startIdleWatch(){
   reset();
 }
 
+// --- multi-vault (Issue #21): active vault + X-Vault header on data calls ---
+let currentVault = null;
+function vfetch(url, opts){
+  opts = opts || {};
+  opts.headers = Object.assign({}, opts.headers || {}, currentVault ? {'X-Vault': currentVault} : {});
+  return fetch(url, opts);
+}
+async function loadVaults(){
+  try {
+    const d = await (await fetch('/api/vaults')).json();
+    const vs = d.vaults || [];
+    const sel = document.getElementById('vault-switcher');
+    if (!sel) return;
+    if (!vs.length){ sel.style.display='none'; currentVault = null; return; }
+    if (!currentVault || !vs.find(v=>v.id===currentVault))
+      currentVault = (vs.find(v=>v.id==='default') || vs[0]).id;
+    sel.innerHTML = vs.map(v =>
+      `<option value="${v.id}"${v.id===currentVault?' selected':''}>${v.name}${v.agent_access==='deny'?' \u{1F512}':''}</option>`
+    ).join('');
+    sel.style.display='';
+  } catch(e){}
+}
+async function switchVault(id){ currentVault = id; await loadVault(); }
+async function createVaultPrompt(){
+  const name = prompt('New vault name (e.g. Work, Personal):');
+  if (!name) return;
+  const d = await (await fetch('/api/vaults', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name})})).json();
+  if (d.error){ toast(d.error); return; }
+  currentVault = d.id;
+  toast('Vault "' + name + '" created');
+  await loadVaults();
+  await loadVault();
+}
+
 async function initApp(){
   const st = await refreshLockUI();
   if (st.enabled && st.locked){ showLockScreen(st, 'unlock'); return; }
   if (st.enabled){ startIdleWatch(); }
+  await loadVaults();
   loadVault();
 }
 
 async function loadVault() {
   try {
-    const r = await fetch('/api/vault');
+    const r = await vfetch('/api/vault');
     const d = await r.json();
     if (d.error) { toast(d.error); return; }
     vaultData = d;
@@ -1678,7 +1816,7 @@ async function addSecret() {
     if (!svc || !key || !val) { toast('Service, key, and value are required'); return; }
     payload = {service: svc, key, value: val, note};
   }
-  const r = await fetch('/api/secret', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+  const r = await vfetch('/api/secret', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
   const d = await r.json();
   if (d.error) { toast(d.error); return; }
   closeModal('add-modal');
@@ -1702,7 +1840,7 @@ function showConfirm(msg) {
 async function deleteKey(path) {
   const ok = await showConfirm(`Delete ${path.join(' / ')}?`);
   if (!ok) return;
-  const r = await fetch('/api/secret', {method:'DELETE', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path})});
+  const r = await vfetch('/api/secret', {method:'DELETE', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path})});
   const d = await r.json();
   if (d.error) { toast(d.error); return; }
   toast('Secret deleted successfully');
@@ -1712,7 +1850,7 @@ async function deleteKey(path) {
 async function deleteService(svc) {
   const ok = await showConfirm(`Delete entire service "${svc}" and all its keys?`);
   if (!ok) return;
-  const r = await fetch('/api/service/' + encodeURIComponent(svc), {method:'DELETE'});
+  const r = await vfetch('/api/service/' + encodeURIComponent(svc), {method:'DELETE'});
   const d = await r.json();
   if (d.error) { toast(d.error); return; }
   toast('Service and all keys deleted successfully');
@@ -1728,7 +1866,7 @@ function showNoteModal(path) {
 async function saveNote() {
   if (!notePath) { toast('No secret selected'); return; }
   const note = document.getElementById('note-text').value.trim();
-  const r = await fetch('/api/note', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path: notePath, note})});
+  const r = await vfetch('/api/note', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path: notePath, note})});
   const d = await r.json();
   if (d.error) { toast(d.error); return; }
   closeModal('note-modal');
