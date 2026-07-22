@@ -83,7 +83,7 @@ def _configure_macos_identity(headless=False):
 # ---------------------------------------------------------------------------
 
 APP_NAME = "PX Secrets"
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 REPO_URL = "https://github.com/pxinnovative/px-secrets"
 SUPPORT_URL = "https://buymeacoffee.com/pxinnovative"
 GITHUB_API_BASE = "https://api.github.com/repos/pxinnovative/px-secrets"
@@ -98,6 +98,28 @@ DEFAULT_PORT = 9999
 # Set PX_SECRETS_READ_ONLY=1 to disable mutating endpoints (vault read-only mode).
 # Set PX_SECRETS_AUTH_TOKEN=<token> to require Authorization: Bearer <token> on /api/*.
 HOST_OVERRIDE = os.environ.get("PX_SECRETS_HOST")
+LOOPBACK_BROWSE_HOST = "localhost"
+
+
+def browse_host(bind_host):
+    """Hostname to put in the URL we open, given the address we bound to.
+
+    We bind to a loopback IP by default, but a page served from http://127.0.0.1
+    cannot use WebAuthn at all: an RP ID must be a valid *domain*, and an IP literal
+    is not one. Registration fails with "SecurityError: The effective domain of the
+    document is not a valid domain". `localhost` is the one non-registrable name the
+    spec allows, and it resolves to the same socket, so browsing there costs nothing
+    and makes biometric unlock work.
+
+    Only loopback (and 0.0.0.0, which includes loopback) is rewritten. If someone
+    bound to a specific LAN address on purpose, we must open THAT address or the
+    window would point at a socket the server is not listening on.
+    """
+    if not bind_host or bind_host in ("0.0.0.0", "::", "::1") or bind_host.startswith("127."):
+        return LOOPBACK_BROWSE_HOST
+    return bind_host
+
+
 READ_ONLY = os.environ.get("PX_SECRETS_READ_ONLY", "").lower() in ("1", "true", "yes")
 AUTH_TOKEN = os.environ.get("PX_SECRETS_AUTH_TOKEN", "")
 
@@ -433,12 +455,24 @@ def api_session_create():
 # finger while you are away.
 
 def _webauthn_rp_and_origin():
-    """Derive RP ID and expected origin from the request host.
+    """Derive the Relying Party ID and expected origin from the request host.
 
-    WebAuthn requires a secure context; http://localhost and http://127.0.0.1 both
-    qualify, which is exactly how this app is served.
+    Two requirements are easy to conflate:
+
+    * SECURE CONTEXT: both http://localhost and http://127.0.0.1 qualify, so either
+      will happily run WebAuthn JavaScript.
+    * VALID RP ID: stricter. An RP ID must be a *domain*, and an IP literal is not one.
+      `localhost` is the single non-registrable name the spec permits. A page served
+      from 127.0.0.1 therefore fails at registration with
+      "SecurityError: The effective domain of the document is not a valid domain",
+      which is why browse_host() opens `localhost` rather than the loopback IP.
+
+    Any loopback address is mapped to `localhost`, so someone who typed the IP by hand
+    still gets a working ceremony as long as the document itself is on localhost.
     """
-    host = (request.host or "127.0.0.1:9999").split(":")[0]
+    host = (request.host or f"{LOOPBACK_BROWSE_HOST}:{DEFAULT_PORT}").split(":")[0]
+    if host in ("::1", "0.0.0.0") or host.startswith("127."):
+        host = LOOPBACK_BROWSE_HOST
     return host, request.headers.get("Origin") or f"{request.scheme}://{request.host}"
 
 
@@ -448,11 +482,29 @@ def api_webauthn_status():
                     "credentials": px_webauthn.list_credentials()})
 
 
+def _webauthn_unusable_reason(rp_id):
+    """Explain, in the user's terms, why a biometric cannot be enrolled here.
+
+    Reached when the app is opened over a LAN address or a container port map. The
+    browser would otherwise throw a bare SecurityError that says nothing actionable.
+    """
+    import ipaddress
+    try:
+        ipaddress.ip_address(rp_id)
+    except ValueError:
+        return None          # a hostname: fine
+    return ("Biometric unlock needs the app opened at http://localhost:%d, not an IP "
+            "address. WebAuthn requires a real domain name, and an IP is not one." % DEFAULT_PORT)
+
+
 @app.route("/api/webauthn/register/begin", methods=["POST"])
 def api_webauthn_register_begin():
     if not _session_valid(request.cookies.get(SESSION_COOKIE, "")):
         return jsonify({"error": "Unlock the app before enrolling a biometric"}), 401
     rp_id, _ = _webauthn_rp_and_origin()
+    reason = _webauthn_unusable_reason(rp_id)
+    if reason:
+        return jsonify({"error": reason}), 400
     return jsonify(px_webauthn.registration_options(rp_id))
 
 
@@ -888,7 +940,7 @@ def api_save_settings():
 def api_open_browser():
     """Open the UI in the system's default browser."""
     port = app.config.get("port", DEFAULT_PORT)
-    webbrowser.open(f"http://{DEFAULT_HOST}:{port}")
+    webbrowser.open(f"http://{browse_host(HOST_OVERRIDE or DEFAULT_HOST)}:{port}")
     return jsonify({"ok": True})
 
 
@@ -1312,6 +1364,9 @@ h1{font-size:22px;font-weight:600;color:var(--accent)}
 .toast-container{position:fixed;bottom:16px;right:16px;z-index:200;display:flex;flex-direction:column;gap:6px}
 .toast{background:rgba(102,187,106,0.15);color:var(--success);border:1px solid rgba(102,187,106,0.3);padding:10px 20px;border-radius:10px;font-size:13px;opacity:0;transform:translateY(10px);transition:all .3s;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);pointer-events:none}
 .toast.show{opacity:1;transform:translateY(0)}
+/* Failures were rendering in the success green, which reads as "it worked" at a
+   glance and is exactly backwards. Errors get the danger colour. */
+.toast.toast-error{background:rgba(229,83,75,0.15);color:var(--danger);border-color:rgba(229,83,75,0.35)}
 /* Generator */
 .gen-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px;max-height:55vh;overflow-y:auto;padding-right:4px}
 .gen-category{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:10px}
@@ -1636,7 +1691,7 @@ async function bioUnlock(){
 async function bioEnroll(){
   try {
     const opts = await (await window.fetch('/api/webauthn/register/begin', {method:'POST'})).json();
-    if (opts.error){ toast(opts.error); return; }
+    if (opts.error){ toast(opts.error, 'error'); return; }
     const cred = await navigator.credentials.create({publicKey: {
       challenge: _b64uToBuf(opts.challenge),
       rp: opts.rp,
@@ -1649,7 +1704,7 @@ async function bioEnroll(){
     }});
     // getPublicKey() hands us SPKI DER directly — no CBOR attestation parsing needed.
     const spki = cred.response.getPublicKey ? cred.response.getPublicKey() : null;
-    if (!spki){ toast('This browser cannot export the public key (needs a newer version)'); return; }
+    if (!spki){ toast('This browser cannot export the public key (needs a newer version)', 'error'); return; }
     const r = await (await window.fetch('/api/webauthn/register/finish', {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({
@@ -1658,11 +1713,11 @@ async function bioEnroll(){
         publicKey: _bufToB64u(spki),
         label: (navigator.platform || 'this device'),
       })})).json();
-    if (r.error){ toast(r.error); return; }
+    if (r.error){ toast(r.error, 'error'); return; }
     toast('Biometric unlock enabled');
     await refreshBioUI();
   } catch(e){
-    toast((e && e.name === 'NotAllowedError') ? 'Enrolment cancelled' : ('Enrolment failed: ' + e));
+    toast((e && e.name === 'NotAllowedError') ? 'Enrolment cancelled' : ('Enrolment failed: ' + e), 'error');
   }
 }
 
@@ -1782,7 +1837,7 @@ async function loadVaults(){
     // Never swallow this silently: an empty catch here is why a hidden switcher
     // looked like "the feature does not exist" instead of "the call failed".
     console.error('loadVaults failed:', e);
-    toast('Could not load vault list: ' + (e && e.message ? e.message : e));
+    toast('Could not load vault list: ' + (e && e.message ? e.message : e), 'error');
   }
 }
 async function switchVault(id){ currentVault = id; await loadVault(); }
@@ -2152,10 +2207,15 @@ function toggleMasked(inputId, eyeId) {
   else { el.type = 'password'; btn.style.color = ''; }
 }
 
-function toast(msg) {
+// kind: 'ok' (default) or 'error'. Callers that report a failure MUST pass 'error',
+// otherwise the message renders in success green and reads as if it worked.
+function toast(msg, kind) {
   const c = document.getElementById('toasts');
   const t = document.createElement('div');
-  t.className = 'toast';
+  // Heuristic safety net for existing call sites that never learned about `kind`:
+  // if the text plainly announces a failure, colour it as one.
+  const looksBad = /\b(fail(ed|ure)?|error|denied|cannot|could not|invalid|unable|refused|not supported)\b/i.test(String(msg));
+  t.className = 'toast' + ((kind === 'error' || (kind === undefined && looksBad)) ? ' toast-error' : '');
   t.textContent = msg;
   c.appendChild(t);
   requestAnimationFrame(() => t.classList.add('show'));
@@ -2465,7 +2525,9 @@ def main():
 
         webview.create_window(
             APP_NAME,
-            f"http://{host}:{port}",
+            # browse_host(): loopback becomes "localhost" so WebAuthn works, but a
+            # deliberate LAN bind is preserved so the window points at a live socket.
+            f"http://{browse_host(host)}:{port}",
             width=NATIVE_WINDOW_WIDTH,
             height=NATIVE_WINDOW_HEIGHT,
         )

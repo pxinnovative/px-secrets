@@ -6,6 +6,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Versions follow [Semant
 
 ---
 
+## [1.8.1] — 2026-07-22
+
+### Fixed
+- **Biometric enrolment always failed with `SecurityError: The effective domain of the document is not a valid domain`** — the app opened itself at `http://127.0.0.1`, and WebAuthn does not accept an IP literal as a Relying Party ID. An RP ID must be a real domain, and `localhost` is the one non-registrable name the spec allows. The app now opens `http://localhost` (same loopback socket, so nothing else changes) and maps any loopback bind address to `localhost` server-side. A deliberate LAN bind via `PX_SECRETS_HOST` is preserved rather than rewritten, so that deployment still opens a URL the server is actually listening on. Covered by `tests/test_browse_host.py`.
+- **Opening the app over a LAN address or a container port map now explains itself** — instead of the browser throwing a bare `SecurityError`, enrolment returns a message saying biometrics need `http://localhost` because WebAuthn requires a domain name.
+- **Error toasts rendered in the success colour** — a failure appeared in green, which reads as "it worked" at a glance. Toasts now take a kind, failures render in the danger colour, and a heuristic catches older call sites that announce a failure in their text.
+
 ## [1.8.0] — 2026-07-22
 
 ### Added
