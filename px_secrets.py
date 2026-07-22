@@ -83,7 +83,7 @@ def _configure_macos_identity(headless=False):
 # ---------------------------------------------------------------------------
 
 APP_NAME = "PX Secrets"
-VERSION = "1.8.1"
+VERSION = "1.8.2"
 REPO_URL = "https://github.com/pxinnovative/px-secrets"
 SUPPORT_URL = "https://buymeacoffee.com/pxinnovative"
 GITHUB_API_BASE = "https://api.github.com/repos/pxinnovative/px-secrets"
@@ -1644,6 +1644,17 @@ function bioSupported(){
   return !!(window.PublicKeyCredential && navigator.credentials && navigator.credentials.create);
 }
 
+// The WebAuthn API existing is NOT the same as a usable fingerprint/face sensor.
+// Embedded webviews and "add to dock" web apps expose the API but have no platform
+// authenticator behind it, so navigator.credentials.create() rejects instantly with
+// NotAllowedError — indistinguishable from the user hitting Cancel. Ask first.
+async function bioPlatformAvailable(){
+  if (!bioSupported()) return false;
+  try {
+    return await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
+  } catch(e){ return false; }
+}
+
 // Reveal the lock-screen biometric button only when something is actually enrolled.
 async function refreshBioUI(){
   const btn = document.getElementById('bio-btn');
@@ -1652,10 +1663,15 @@ async function refreshBioUI(){
   const rem = document.getElementById('bio-remove-btn');
   let d = {enrolled:false, credentials:[]};
   try { d = await (await window.fetch('/api/webauthn/status')).json(); } catch(e){}
-  const usable = bioSupported();
+  const hasApi = bioSupported();
+  const usable = await bioPlatformAvailable();
   if (btn) btn.style.display = (d.enrolled && usable) ? '' : 'none';
-  if (st)  st.textContent = !usable ? 'Not supported by this browser'
-            : (d.enrolled ? ('ON — ' + d.credentials.map(c=>c.label).join(', ')) : 'OFF');
+  if (st){
+    if (!hasApi)       st.textContent = 'Not supported by this browser';
+    else if (!usable)  st.textContent = 'No fingerprint/face sensor available in this window. Open the app in Safari or Chrome at http://localhost:' + location.port + ' to enrol.';
+    else if (d.enrolled) st.textContent = 'ON — ' + d.credentials.map(c=>c.label).join(', ');
+    else               st.textContent = 'OFF';
+  }
   if (enr) enr.style.display = (usable && !d.enrolled) ? '' : 'none';
   if (rem) rem.style.display = d.enrolled ? '' : 'none';
   return d;
@@ -1689,6 +1705,13 @@ async function bioUnlock(){
 }
 
 async function bioEnroll(){
+  // Check for a real sensor first. Without this, an embedded webview rejects with
+  // NotAllowedError and the user just sees "Enrolment cancelled" forever, with no
+  // hint that the window itself is the problem rather than their finger.
+  if (!(await bioPlatformAvailable())){
+    toast('This window has no fingerprint or face sensor available. Open the app in Safari or Chrome at http://localhost:' + location.port + ' and enrol there.', 'error');
+    return;
+  }
   try {
     const opts = await (await window.fetch('/api/webauthn/register/begin', {method:'POST'})).json();
     if (opts.error){ toast(opts.error, 'error'); return; }

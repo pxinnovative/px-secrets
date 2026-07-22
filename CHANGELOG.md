@@ -6,6 +6,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Versions follow [Semant
 
 ---
 
+## [1.8.2] — 2026-07-22
+
+### Fixed
+- **"Enrolment cancelled" with no way to tell why** — a window can expose the WebAuthn API while having no platform authenticator behind it (embedded webviews, "add to dock" web apps). `navigator.credentials.create()` then rejects instantly with `NotAllowedError`, which is indistinguishable from the user pressing Cancel, so the app reported a cancellation the user never made. Enrolment now checks `isUserVerifyingPlatformAuthenticatorAvailable()` first and says which window to use instead. The Settings row reports the same thing rather than showing an Enable button that cannot work.
+
+### Added
+- **`tests/test_webauthn.py`** — 16 cases covering the emitted registration options and every rejection path in assertion verification: missing user-verification flag, wrong origin, RP ID hash mismatch, tampered signature, replayed challenge, unknown credential, and a non-increasing signature counter. Also asserts the stored credential never contains private material and the user handle carries no identity.
+
 ## [1.8.1] — 2026-07-22
 
 ### Fixed
