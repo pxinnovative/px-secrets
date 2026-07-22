@@ -45,7 +45,9 @@ PX Secrets fills the gap between "I keep my secrets in `.env` files" and "I need
 - **Native window** — Optional pywebview mode for a desktop-app experience.
 - **Clipboard auto-clear** — Copied secrets are wiped from clipboard after 30 seconds.
 - **Notes per secret** — Attach context to any key (expiration dates, rotation info, etc.).
-- **Settings UI** — Configure vault path, AGE key file, and public key from the GUI.
+- **Multiple vaults**: separate vaults with their own recipients and access policy, switchable from the toolbar.
+- **App lock + biometric unlock**: optional master-password lock with idle auto-lock, plus Touch ID, Face ID or Windows Hello via WebAuthn so you are not retyping a password all day. The private key stays in the device's secure enclave, and the password remains as the fallback.
+- **Settings UI**: configure vault path, AGE key file, and public key from the GUI.
 - **Headless mode** — Run as a background server for automation and LaunchAgents.
 - **macOS native identity** — Shows as "PX Secrets" in Activity Monitor and menu bar; Dock icon hidden in headless mode.
 - **Single file** — One Python file, no build step, no complex setup.

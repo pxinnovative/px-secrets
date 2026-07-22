@@ -27,6 +27,7 @@ import yaml
 from flask import Flask, jsonify, make_response, request
 
 import px_vaults  # multi-vault layer (Issue #21)
+import px_webauthn  # biometric unlock (Touch ID / Face ID / Windows Hello)
 
 # ---------------------------------------------------------------------------
 # macOS App Identity (Phase 1 of Issue #10)
@@ -82,7 +83,7 @@ def _configure_macos_identity(headless=False):
 # ---------------------------------------------------------------------------
 
 APP_NAME = "PX Secrets"
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 REPO_URL = "https://github.com/pxinnovative/px-secrets"
 SUPPORT_URL = "https://buymeacoffee.com/pxinnovative"
 GITHUB_API_BASE = "https://api.github.com/repos/pxinnovative/px-secrets"
@@ -276,7 +277,9 @@ def _bearer_auth_guard():
         return None
     if not request.path.startswith("/api/"):
         return None
-    if request.path in ("/api/lock/status", "/api/session", "/api/lock/setup"):
+    if request.path in ("/api/lock/status", "/api/session", "/api/lock/setup",
+                         "/api/webauthn/status", "/api/webauthn/auth/begin",
+                         "/api/webauthn/auth/finish"):
         return None
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer ") and secrets.compare_digest(auth_header[7:].strip(), AUTH_TOKEN):
@@ -370,7 +373,9 @@ def _ui_lock_guard():
     path = request.path
     if not path.startswith("/api/"):
         return None
-    if path in ("/api/lock/status", "/api/session", "/api/lock/setup"):
+    if path in ("/api/lock/status", "/api/session", "/api/lock/setup",
+                         "/api/webauthn/status", "/api/webauthn/auth/begin",
+                         "/api/webauthn/auth/finish"):
         return None
     if AUTH_TOKEN:
         ah = request.headers.get("Authorization", "")
@@ -418,6 +423,81 @@ def api_session_create():
     resp = make_response(jsonify({"ok": True}))
     resp.set_cookie(SESSION_COOKIE, _new_session(), httponly=True, samesite="Strict")
     return resp
+
+
+# --------------------------------------------------------------------------- WebAuthn
+# Biometric unlock (Touch ID / Face ID / Windows Hello). This AUGMENTS the master
+# password; it never replaces it, so a lost device can never lock you out.
+# Enrolment requires an already-unlocked session — you cannot bootstrap a credential
+# from a locked app, which is what stops someone at the keyboard enrolling their own
+# finger while you are away.
+
+def _webauthn_rp_and_origin():
+    """Derive RP ID and expected origin from the request host.
+
+    WebAuthn requires a secure context; http://localhost and http://127.0.0.1 both
+    qualify, which is exactly how this app is served.
+    """
+    host = (request.host or "127.0.0.1:9999").split(":")[0]
+    return host, request.headers.get("Origin") or f"{request.scheme}://{request.host}"
+
+
+@app.route("/api/webauthn/status")
+def api_webauthn_status():
+    return jsonify({"enrolled": px_webauthn.is_enrolled(),
+                    "credentials": px_webauthn.list_credentials()})
+
+
+@app.route("/api/webauthn/register/begin", methods=["POST"])
+def api_webauthn_register_begin():
+    if not _session_valid(request.cookies.get(SESSION_COOKIE, "")):
+        return jsonify({"error": "Unlock the app before enrolling a biometric"}), 401
+    rp_id, _ = _webauthn_rp_and_origin()
+    return jsonify(px_webauthn.registration_options(rp_id))
+
+
+@app.route("/api/webauthn/register/finish", methods=["POST"])
+def api_webauthn_register_finish():
+    if not _session_valid(request.cookies.get(SESSION_COOKIE, "")):
+        return jsonify({"error": "Unlock the app before enrolling a biometric"}), 401
+    rp_id, origin = _webauthn_rp_and_origin()
+    try:
+        return jsonify({"ok": True, "credential": px_webauthn.verify_registration(
+            request.json or {}, rp_id, origin)})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/webauthn/auth/begin", methods=["POST"])
+def api_webauthn_auth_begin():
+    if not _lock_enabled():
+        return jsonify({"error": "App lock is not configured"}), 400
+    try:
+        return jsonify(px_webauthn.authentication_options())
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/webauthn/auth/finish", methods=["POST"])
+def api_webauthn_auth_finish():
+    if not _lock_enabled():
+        return jsonify({"error": "App lock is not configured"}), 400
+    rp_id, origin = _webauthn_rp_and_origin()
+    try:
+        cred = px_webauthn.verify_authentication(request.json or {}, rp_id, origin)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 401
+    resp = make_response(jsonify({"ok": True, "credential": cred}))
+    resp.set_cookie(SESSION_COOKIE, _new_session(), httponly=True, samesite="Strict")
+    return resp
+
+
+@app.route("/api/webauthn/credential", methods=["DELETE"])
+def api_webauthn_delete():
+    if not _session_valid(request.cookies.get(SESSION_COOKIE, "")):
+        return jsonify({"error": "Unlock the app first"}), 401
+    cred_id = (request.json or {}).get("id", "")
+    return jsonify({"ok": px_webauthn.delete_credential(cred_id)})
 
 
 @app.route("/api/session", methods=["DELETE"])
@@ -1157,9 +1237,28 @@ h1{font-size:22px;font-weight:600;color:var(--accent)}
 .icon-btn{background:transparent;border:none;color:var(--muted);font-size:16px;cursor:pointer;padding:4px;transition:color .15s;text-decoration:none;line-height:1}
 .icon-btn:hover{color:var(--accent)}
 .icon-btn[title]:hover::after{content:attr(title)}
-.toolbar{display:flex;gap:6px;margin-bottom:10px;align-items:center}
-.toolbar input[type=text]{flex:1;background:var(--card);border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:6px;font-size:14px;outline:none}
+/* Toolbar wraps instead of overflowing. Before this, a single nowrap flex row pushed
+   Export outside the viewport as soon as the vault switcher became visible. */
+.toolbar{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px;align-items:center}
+.toolbar input[type=text]{flex:1 1 180px;min-width:140px;background:var(--card);border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:6px;font-size:14px;outline:none}
 .toolbar input[type=text]:focus{border-color:var(--accent)}
+/* A vault name can be arbitrarily long: cap and ellipsize it rather than let it
+   dictate the width of the whole toolbar row. */
+#vault-switcher{max-width:170px;background:var(--card);border:1px solid var(--border);color:var(--text);padding:7px 8px;border-radius:6px;font-size:13px;outline:none;text-overflow:ellipsis}
+
+/* Narrow windows: shrink controls, and give search its own full-width row, before
+   anything is ever allowed to overflow. */
+@media (max-width:760px){
+  .toolbar{gap:5px}
+  .toolbar .btn{padding:6px 9px;font-size:12px}
+  #vault-switcher{max-width:130px;font-size:12px}
+  .toolbar input[type=text]{flex:1 1 100%;order:-1}
+}
+@media (max-width:480px){
+  .toolbar .btn{flex:1 1 auto;text-align:center;padding:7px 6px}
+  #vault-switcher{flex:1 1 auto;max-width:none}
+  .header-icons{flex-wrap:wrap}
+}
 .btn{background:transparent;color:var(--text);border:1px solid var(--border);padding:6px 12px;border-radius:6px;cursor:pointer;font-size:13px;white-space:nowrap;transition:all .15s}
 .btn:hover{border-color:var(--accent);color:var(--accent)}
 .btn-accent{border-color:var(--accent);color:var(--accent)}
@@ -1242,6 +1341,9 @@ h1{font-size:22px;font-weight:600;color:var(--accent)}
     <input id="lock-pass2" type="password" placeholder="Confirm password" autocomplete="off" style="display:none" onkeydown="if(event.key==='Enter')lockSubmit()">
     <div id="lock-err" style="color:#e5534b;font-size:12px;min-height:15px;margin:2px 0"></div>
     <button class="btn btn-accent" style="width:100%" id="lock-btn" onclick="lockSubmit()">Unlock</button>
+    <!-- Only rendered when an authenticator is enrolled. The master password stays
+         above as the recovery path, so a lost device can never lock you out. -->
+    <button class="btn" style="width:100%;margin-top:8px;display:none" id="bio-btn" onclick="bioUnlock()">&#128075; Unlock with Touch ID / Face ID</button>
   </div>
 </div>
 
@@ -1319,6 +1421,13 @@ h1{font-size:22px;font-weight:600;color:var(--accent)}
         <button class="btn" id="lock-enable-btn" onclick="closeModal('settings-modal');enableLock()">Enable</button>
         <button class="btn btn-danger" id="lock-disable-btn" onclick="disableLock()" style="display:none">Disable</button>
         <span id="lock-state" style="font-size:12px;color:var(--muted)"></span>
+      </div>
+      <label style="margin-top:12px">Biometric Unlock</label>
+      <div style="font-size:11px;color:var(--muted);margin:2px 0 8px">Unlock with Touch&nbsp;ID, Face&nbsp;ID or Windows&nbsp;Hello instead of typing the master password every time. The key never leaves this device's secure enclave, and the password always stays available as a fallback.</div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button class="btn" id="bio-enroll-btn" onclick="bioEnroll()" style="display:none">Enable biometric</button>
+        <button class="btn btn-danger" id="bio-remove-btn" onclick="bioRemove()" style="display:none">Remove</button>
+        <span id="bio-state" style="font-size:12px;color:var(--muted)"></span>
       </div>
     </div>
     <label>Vault File Path</label>
@@ -1462,6 +1571,111 @@ let revealedKeys = {};
 let openCards = new Set();
 let openGroups = new Set();
 
+// ---- Biometric unlock (Touch ID / Face ID / Windows Hello) ----
+// Base64URL <-> ArrayBuffer, because WebAuthn speaks ArrayBuffer and JSON does not.
+function _b64uToBuf(s){
+  const pad = '='.repeat((4 - s.length % 4) % 4);
+  const bin = atob((s + pad).replace(/-/g,'+').replace(/_/g,'/'));
+  const b = new Uint8Array(bin.length);
+  for (let i=0;i<bin.length;i++) b[i] = bin.charCodeAt(i);
+  return b.buffer;
+}
+function _bufToB64u(buf){
+  const b = new Uint8Array(buf); let s = '';
+  for (let i=0;i<b.length;i++) s += String.fromCharCode(b[i]);
+  return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+}
+function bioSupported(){
+  return !!(window.PublicKeyCredential && navigator.credentials && navigator.credentials.create);
+}
+
+// Reveal the lock-screen biometric button only when something is actually enrolled.
+async function refreshBioUI(){
+  const btn = document.getElementById('bio-btn');
+  const st  = document.getElementById('bio-state');
+  const enr = document.getElementById('bio-enroll-btn');
+  const rem = document.getElementById('bio-remove-btn');
+  let d = {enrolled:false, credentials:[]};
+  try { d = await (await window.fetch('/api/webauthn/status')).json(); } catch(e){}
+  const usable = bioSupported();
+  if (btn) btn.style.display = (d.enrolled && usable) ? '' : 'none';
+  if (st)  st.textContent = !usable ? 'Not supported by this browser'
+            : (d.enrolled ? ('ON — ' + d.credentials.map(c=>c.label).join(', ')) : 'OFF');
+  if (enr) enr.style.display = (usable && !d.enrolled) ? '' : 'none';
+  if (rem) rem.style.display = d.enrolled ? '' : 'none';
+  return d;
+}
+
+async function bioUnlock(){
+  const err = document.getElementById('lock-err');
+  try {
+    const opts = await (await window.fetch('/api/webauthn/auth/begin', {method:'POST'})).json();
+    if (opts.error){ if(err) err.textContent = opts.error; return; }
+    const assertion = await navigator.credentials.get({publicKey: {
+      challenge: _b64uToBuf(opts.challenge),
+      timeout: opts.timeout,
+      userVerification: opts.userVerification,
+      allowCredentials: (opts.allowCredentials||[]).map(c=>({type:'public-key', id:_b64uToBuf(c.id)})),
+    }});
+    const r = await (await window.fetch('/api/webauthn/auth/finish', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        id: assertion.id,
+        clientDataJSON:    _bufToB64u(assertion.response.clientDataJSON),
+        authenticatorData: _bufToB64u(assertion.response.authenticatorData),
+        signature:         _bufToB64u(assertion.response.signature),
+      })})).json();
+    if (r.error){ if(err) err.textContent = r.error; return; }
+    hideLockScreen(); startIdleWatch(); await loadVaults(); loadVault();
+  } catch(e){
+    // A user cancelling the prompt is not an error worth shouting about.
+    if (err) err.textContent = (e && e.name === 'NotAllowedError') ? 'Biometric cancelled' : ('Biometric failed: ' + e);
+  }
+}
+
+async function bioEnroll(){
+  try {
+    const opts = await (await window.fetch('/api/webauthn/register/begin', {method:'POST'})).json();
+    if (opts.error){ toast(opts.error); return; }
+    const cred = await navigator.credentials.create({publicKey: {
+      challenge: _b64uToBuf(opts.challenge),
+      rp: opts.rp,
+      user: {id:_b64uToBuf(opts.user.id), name:opts.user.name, displayName:opts.user.displayName},
+      pubKeyCredParams: opts.pubKeyCredParams,
+      timeout: opts.timeout,
+      attestation: opts.attestation,
+      authenticatorSelection: opts.authenticatorSelection,
+      excludeCredentials: (opts.excludeCredentials||[]).map(c=>({type:'public-key', id:_b64uToBuf(c.id)})),
+    }});
+    // getPublicKey() hands us SPKI DER directly — no CBOR attestation parsing needed.
+    const spki = cred.response.getPublicKey ? cred.response.getPublicKey() : null;
+    if (!spki){ toast('This browser cannot export the public key (needs a newer version)'); return; }
+    const r = await (await window.fetch('/api/webauthn/register/finish', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        id: cred.id,
+        clientDataJSON: _bufToB64u(cred.response.clientDataJSON),
+        publicKey: _bufToB64u(spki),
+        label: (navigator.platform || 'this device'),
+      })})).json();
+    if (r.error){ toast(r.error); return; }
+    toast('Biometric unlock enabled');
+    await refreshBioUI();
+  } catch(e){
+    toast((e && e.name === 'NotAllowedError') ? 'Enrolment cancelled' : ('Enrolment failed: ' + e));
+  }
+}
+
+async function bioRemove(){
+  const d = await (await window.fetch('/api/webauthn/status')).json();
+  for (const c of (d.credentials||[])){
+    await window.fetch('/api/webauthn/credential', {method:'DELETE',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({id:c.id})});
+  }
+  toast('Biometric unlock removed');
+  await refreshBioUI();
+}
+
 // ---- App lock (issue #19): master-password gate + idle auto-lock ----
 let _lockMode = 'unlock';
 let _idleTimer = null, _idleMs = 300000, _idleBound = false;
@@ -1478,6 +1692,7 @@ async function refreshLockUI(){
   if (en) en.style.display = st.enabled ? 'none' : '';
   if (dis) dis.style.display = st.enabled ? '' : 'none';
   if (ls) ls.textContent = st.enabled ? ('ON — auto-locks after ' + Math.round((st.idle_timeout_s||300)/60) + ' min idle') : 'OFF';
+  refreshBioUI();
   return st;
 }
 
@@ -1508,11 +1723,15 @@ async function lockSubmit(){
     if (pass !== pass2){ err.textContent = 'Passwords do not match'; return; }
     const d = await (await fetch('/api/lock/setup', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({password:pass})})).json();
     if (d.error){ err.textContent = d.error; return; }
-    hideLockScreen(); await refreshLockUI(); startIdleWatch(); toast('App lock enabled'); loadVault();
+    // loadVaults() must run here too: initApp() returns early while the app is
+    // locked, so this is the only place the vault switcher gets populated after
+    // an unlock. Without it the switcher stays display:none and the user can
+    // create vaults but never see or switch between them.
+    hideLockScreen(); await refreshLockUI(); startIdleWatch(); toast('App lock enabled'); await loadVaults(); loadVault();
   } else {
     const d = await (await fetch('/api/session', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({password:pass})})).json();
     if (d.error){ err.textContent = d.error || 'Incorrect password'; return; }
-    hideLockScreen(); startIdleWatch(); loadVault();
+    hideLockScreen(); startIdleWatch(); await loadVaults(); loadVault();
   }
 }
 
@@ -1559,7 +1778,12 @@ async function loadVaults(){
       `<option value="${v.id}"${v.id===currentVault?' selected':''}>${v.name}${v.agent_access==='deny'?' \u{1F512}':''}</option>`
     ).join('');
     sel.style.display='';
-  } catch(e){}
+  } catch(e){
+    // Never swallow this silently: an empty catch here is why a hidden switcher
+    // looked like "the feature does not exist" instead of "the call failed".
+    console.error('loadVaults failed:', e);
+    toast('Could not load vault list: ' + (e && e.message ? e.message : e));
+  }
 }
 async function switchVault(id){ currentVault = id; await loadVault(); }
 async function createVaultPrompt(){
@@ -1573,7 +1797,18 @@ async function createVaultPrompt(){
   await loadVault();
 }
 
+// CSS cannot rewrite a placeholder, so shorten it in JS on narrow viewports.
+// "Search services or keys..." is the single widest item in the toolbar.
+function adaptSearchPlaceholder(){
+  const s = document.getElementById('search');
+  if (!s) return;
+  const w = window.innerWidth;
+  s.placeholder = w < 480 ? 'Search...' : (w < 760 ? 'Search keys...' : 'Search services or keys...');
+}
+window.addEventListener('resize', adaptSearchPlaceholder);
+
 async function initApp(){
+  adaptSearchPlaceholder();
   const st = await refreshLockUI();
   if (st.enabled && st.locked){ showLockScreen(st, 'unlock'); return; }
   if (st.enabled){ startIdleWatch(); }

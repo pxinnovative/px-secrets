@@ -6,6 +6,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Versions follow [Semant
 
 ---
 
+## [1.8.0] — 2026-07-22
+
+### Added
+- **Biometric unlock** — unlock with Touch ID, Face ID or Windows Hello instead of re-typing the master password at every idle timeout. This is the follow-up promised in [#19](../../issues/19). Built on WebAuthn platform authenticators: the private key never leaves the device's secure enclave, and `userVerification` is **required** both in the request options and re-checked server-side in the authenticator-data flags, so a mere presence tap cannot substitute for a biometric. Enrolment requires an already-unlocked session, which prevents someone at your keyboard from enrolling their own finger while you are away. The master password always remains available as the recovery path, so a lost or reset device can never lock you out. Enable in **Settings → Biometric Unlock**.
+  - **No new dependencies.** Attestation objects are never parsed: the browser's `getPublicKey()` returns the key as SPKI DER, which `cryptography` consumes directly. That removes a CBOR dependency and an entire class of parsing bugs. Attestation is deliberately not verified — this authenticates "the same authenticator that enrolled" on a local single-user app; it is not enterprise device-provenance.
+  - Credential metadata lives in `~/.px-secrets/webauthn.json` (mode 0600). Only credential IDs and **public** keys are stored.
+
+### Fixed
+- **Vault switcher was invisible whenever the app lock was enabled** — `initApp()` returns early while locked, and the unlock path called `loadVault()` (contents) but never `loadVaults()` (the switcher list). The `<select>` therefore stayed `display:none` forever: you could create vaults but never see or switch between them. Both unlock paths now populate it. ([#21](../../issues/21))
+- **`loadVaults()` swallowed every error in an empty `catch`** — a failed vault list looked identical to "this feature does not exist", which is exactly what hid the bug above. Failures now log to the console and surface a toast.
+
+### Changed
+- **Responsive toolbar** — the toolbar was a single non-wrapping flex row, so adding the vault switcher pushed **Export** outside the viewport with no way to scroll to it. It now wraps; the search field takes its own full-width row below 760px; buttons and the vault selector shrink at narrow widths; long vault names ellipsize instead of dictating row width; and the search placeholder shortens on small screens. These are the first media queries in the project.
+
 ## [1.7.0] — 2026-06-08
 
 ### Added
