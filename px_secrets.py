@@ -83,7 +83,7 @@ def _configure_macos_identity(headless=False):
 # ---------------------------------------------------------------------------
 
 APP_NAME = "PX Secrets"
-VERSION = "1.8.3"
+VERSION = "1.9.0"
 REPO_URL = "https://github.com/pxinnovative/px-secrets"
 SUPPORT_URL = "https://buymeacoffee.com/pxinnovative"
 GITHUB_API_BASE = "https://api.github.com/repos/pxinnovative/px-secrets"
@@ -1437,9 +1437,13 @@ h1{font-size:22px;font-weight:600;color:var(--accent)}
     <h2 id="add-modal-title">Add Secret</h2>
     <label>Service</label>
     <div class="svc-chips" id="svc-chips"></div>
-    <input id="add-service" placeholder="New service or click one above" style="margin-top:6px">
+    <input id="add-service" placeholder="New service or click one above" style="margin-top:6px" oninput="updatePathPreview()">
+    <label>Group <span style="font-weight:400;color:var(--muted)">(optional)</span></label>
+    <div style="font-size:11px;color:var(--muted);margin:2px 0 4px">Nest the key inside a group instead of putting it directly under the service. Use <code>/</code> to go deeper.</div>
+    <input id="add-group" placeholder="e.g. alice   or   eu / tenant-1" oninput="updatePathPreview()">
     <label>Key Name</label>
-    <input id="add-key" placeholder="e.g. access_key_id">
+    <input id="add-key" placeholder="e.g. access_key_id" oninput="updatePathPreview()">
+    <div id="add-path-preview" class="mono" style="font-size:11px;color:var(--muted);margin-top:5px;min-height:14px"></div>
     <label>Value</label>
     <input id="add-value" type="password" placeholder="secret value">
     <label>Note (optional)</label>
@@ -2097,14 +2101,31 @@ function showAddModal() {
   document.getElementById('add-service').readOnly = false;
   document.getElementById('add-key').readOnly = false;
   document.getElementById('add-value').placeholder = 'secret value';
+  setGroupFieldVisible(true);
   updateServiceHints();
+  updatePathPreview();
   document.getElementById('add-modal').classList.add('show');
   document.getElementById('add-service').focus();
+}
+
+// The group field only makes sense when creating. Editing targets an existing
+// path, so showing it there would imply you can move a secret from this modal.
+function setGroupFieldVisible(show){
+  const inp = document.getElementById('add-group');
+  if (!inp) return;
+  if (!show) inp.value = '';
+  // label + hint + input are the three nodes that belong to this field
+  const hint = inp.previousElementSibling;
+  const label = hint ? hint.previousElementSibling : null;
+  [inp, hint, label].forEach(n => { if (n) n.style.display = show ? '' : 'none'; });
+  const prev = document.getElementById('add-path-preview');
+  if (prev && !show) prev.textContent = '';
 }
 
 function showEditModal(path) {
   editMode = true;
   editPath = path;
+  setGroupFieldVisible(false);
   document.getElementById('add-modal-title').textContent = 'Edit Secret';
   // Location is read-only (edit value/note only). For nested paths the parent
   // chain is shown as "service / tenant" and the leaf key separately.
@@ -2119,6 +2140,23 @@ function showEditModal(path) {
   document.getElementById('add-value').focus();
 }
 
+// "alice", "eu/tenant-1" and "eu / tenant-1" all mean the same nesting.
+function addGroupSegments(){
+  const g = document.getElementById('add-group');
+  if (!g) return [];
+  return g.value.split('/').map(s => s.trim()).filter(Boolean);
+}
+
+// Show exactly where the secret will land, so nesting is not guesswork.
+function updatePathPreview(){
+  const el = document.getElementById('add-path-preview');
+  if (!el) return;
+  const svc = (document.getElementById('add-service') || {}).value || '';
+  const key = (document.getElementById('add-key') || {}).value || '';
+  const parts = [svc.trim(), ...addGroupSegments(), key.trim()].filter(Boolean);
+  el.textContent = parts.length > 1 ? 'Will be saved as:  ' + parts.join(' › ') : '';
+}
+
 async function addSecret() {
   const val = document.getElementById('add-value').value;
   const note = document.getElementById('add-note').value.trim();
@@ -2129,8 +2167,13 @@ async function addSecret() {
   } else {
     const svc = document.getElementById('add-service').value.trim();
     const key = document.getElementById('add-key').value.trim();
-    if (!svc || !key || !val) { toast('Service, key, and value are required'); return; }
-    payload = {service: svc, key, value: val, note};
+    if (!svc || !key || !val) { toast('Service, key, and value are required', 'error'); return; }
+    const groups = addGroupSegments();
+    // The API takes an explicit path list for nested writes and creates the
+    // intermediate levels, so a brand-new group needs no separate setup step.
+    payload = groups.length
+      ? {path: [svc, ...groups, key], value: val, note}
+      : {service: svc, key, value: val, note};
   }
   const r = await vfetch('/api/secret', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
   const d = await r.json();

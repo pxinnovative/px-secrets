@@ -6,6 +6,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Versions follow [Semant
 
 ---
 
+## [1.9.0] — 2026-07-22
+
+### Added
+- **Create nested secrets from the Add form** — the API has always accepted an explicit path and creates the intermediate levels, but the UI only ever offered service plus key, so nesting could not be created by hand. Add now has an optional **Group** field: put the key inside a group under the service, and use `/` to nest deeper. A live preview shows exactly where the secret will land (`service > group > key`) so nesting is not guesswork. The field is hidden while editing, since editing targets an existing path. ([#18](../../issues/18))
+
 ## [1.8.3] — 2026-07-22
 
 ### Fixed
