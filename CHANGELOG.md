@@ -6,6 +6,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Versions follow [Semant
 
 ---
 
+## [1.8.3] — 2026-07-22
+
+### Fixed
+- **The native window can never offer Touch ID, and now says so** — `--native` renders through pywebview, which on macOS is a WKWebView. macOS does not grant platform-authenticator access to an embedded webview, so the biometric prompt can never appear there no matter what the app does. Settings now explains this instead of showing an Enable button that cannot work, and attempting enrolment from the native window opens the app in the default browser, where it does work.
+
 ## [1.8.2] — 2026-07-22
 
 ### Fixed

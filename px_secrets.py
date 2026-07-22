@@ -83,7 +83,7 @@ def _configure_macos_identity(headless=False):
 # ---------------------------------------------------------------------------
 
 APP_NAME = "PX Secrets"
-VERSION = "1.8.2"
+VERSION = "1.8.3"
 REPO_URL = "https://github.com/pxinnovative/px-secrets"
 SUPPORT_URL = "https://buymeacoffee.com/pxinnovative"
 GITHUB_API_BASE = "https://api.github.com/repos/pxinnovative/px-secrets"
@@ -1668,7 +1668,7 @@ async function refreshBioUI(){
   if (btn) btn.style.display = (d.enrolled && usable) ? '' : 'none';
   if (st){
     if (!hasApi)       st.textContent = 'Not supported by this browser';
-    else if (!usable)  st.textContent = 'No fingerprint/face sensor available in this window. Open the app in Safari or Chrome at http://localhost:' + location.port + ' to enrol.';
+    else if (!usable)  st.textContent = 'Unavailable in this window. The native window is a WKWebView, and macOS does not grant platform-authenticator access to an embedded webview, so Touch ID cannot be offered here. Open the app in your browser (globe icon) and enrol there.';
     else if (d.enrolled) st.textContent = 'ON — ' + d.credentials.map(c=>c.label).join(', ');
     else               st.textContent = 'OFF';
   }
@@ -1709,7 +1709,10 @@ async function bioEnroll(){
   // NotAllowedError and the user just sees "Enrolment cancelled" forever, with no
   // hint that the window itself is the problem rather than their finger.
   if (!(await bioPlatformAvailable())){
-    toast('This window has no fingerprint or face sensor available. Open the app in Safari or Chrome at http://localhost:' + location.port + ' and enrol there.', 'error');
+    // Offer the way out rather than just refusing: the native window cannot do this,
+    // but the same app in a browser can, and we already have an endpoint for that.
+    toast('Touch ID is not available in this window. Opening the app in your browser so you can enrol there.', 'error');
+    try { await window.fetch('/api/open-browser'); } catch(e){}
     return;
   }
   try {
