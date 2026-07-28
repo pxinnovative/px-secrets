@@ -26,6 +26,9 @@ import uuid
 import yaml
 from flask import Flask, jsonify, make_response, request
 
+import px_vaults  # multi-vault layer (Issue #21)
+import px_webauthn  # biometric unlock (Touch ID / Face ID / Windows Hello)
+
 # ---------------------------------------------------------------------------
 # macOS App Identity (Phase 1 of Issue #10)
 # ---------------------------------------------------------------------------
@@ -80,7 +83,7 @@ def _configure_macos_identity(headless=False):
 # ---------------------------------------------------------------------------
 
 APP_NAME = "PX Secrets"
-VERSION = "1.7.0"
+VERSION = "1.9.0"
 REPO_URL = "https://github.com/pxinnovative/px-secrets"
 SUPPORT_URL = "https://buymeacoffee.com/pxinnovative"
 GITHUB_API_BASE = "https://api.github.com/repos/pxinnovative/px-secrets"
@@ -95,6 +98,28 @@ DEFAULT_PORT = 9999
 # Set PX_SECRETS_READ_ONLY=1 to disable mutating endpoints (vault read-only mode).
 # Set PX_SECRETS_AUTH_TOKEN=<token> to require Authorization: Bearer <token> on /api/*.
 HOST_OVERRIDE = os.environ.get("PX_SECRETS_HOST")
+LOOPBACK_BROWSE_HOST = "localhost"
+
+
+def browse_host(bind_host):
+    """Hostname to put in the URL we open, given the address we bound to.
+
+    We bind to a loopback IP by default, but a page served from http://127.0.0.1
+    cannot use WebAuthn at all: an RP ID must be a valid *domain*, and an IP literal
+    is not one. Registration fails with "SecurityError: The effective domain of the
+    document is not a valid domain". `localhost` is the one non-registrable name the
+    spec allows, and it resolves to the same socket, so browsing there costs nothing
+    and makes biometric unlock work.
+
+    Only loopback (and 0.0.0.0, which includes loopback) is rewritten. If someone
+    bound to a specific LAN address on purpose, we must open THAT address or the
+    window would point at a socket the server is not listening on.
+    """
+    if not bind_host or bind_host in ("0.0.0.0", "::", "::1") or bind_host.startswith("127."):
+        return LOOPBACK_BROWSE_HOST
+    return bind_host
+
+
 READ_ONLY = os.environ.get("PX_SECRETS_READ_ONLY", "").lower() in ("1", "true", "yes")
 AUTH_TOKEN = os.environ.get("PX_SECRETS_AUTH_TOKEN", "")
 
@@ -153,13 +178,39 @@ def save_config(cfg: dict):
 
 load_config()
 
+# Multi-vault (Issue #21): on first run, seed a "Default" vault from the legacy single file (by COPY;
+# the original is left intact). No-op once any vault exists or if no recipient is configured.
+if AGE_PUBLIC_KEY:
+    try:
+        px_vaults.migrate_legacy(VAULT_PATH, [AGE_PUBLIC_KEY])
+    except Exception:
+        pass
+
 # ---------------------------------------------------------------------------
 # SOPS helpers
 # ---------------------------------------------------------------------------
 
 
+def _active_vault_id():
+    """Resolve which vault the current request targets: the `X-Vault` header or `?vault=` param,
+    else the default. Returns None when no vaults exist yet (legacy single-file mode)."""
+    from flask import has_request_context
+    vaults = px_vaults.list_vaults()
+    if not vaults:
+        return None
+    ids = {v["id"] for v in vaults}
+    if has_request_context():
+        sel = request.headers.get("X-Vault") or request.args.get("vault")
+        if sel and sel in ids:
+            return sel
+    return "default" if "default" in ids else vaults[0]["id"]
+
+
 def decrypt_vault() -> dict:
-    """Decrypt the SOPS vault and return its contents as a dict."""
+    """Decrypt the active vault (multi-vault) or the legacy single file, return its contents."""
+    vid = _active_vault_id()
+    if vid is not None:
+        return px_vaults.decrypt(vid, AGE_KEY_FILE)
     if not os.path.exists(VAULT_PATH):
         return {}
     env = os.environ.copy()
@@ -174,7 +225,11 @@ def decrypt_vault() -> dict:
 
 
 def encrypt_vault(data: dict):
-    """Encrypt data and write it to the SOPS vault file."""
+    """Encrypt data to the active vault (multi-vault) or the legacy single file."""
+    vid = _active_vault_id()
+    if vid is not None:
+        px_vaults.encrypt(vid, data, AGE_KEY_FILE)
+        return
     env = os.environ.copy()
     env["SOPS_AGE_KEY_FILE"] = AGE_KEY_FILE
     if AGE_PUBLIC_KEY:
@@ -244,7 +299,9 @@ def _bearer_auth_guard():
         return None
     if not request.path.startswith("/api/"):
         return None
-    if request.path in ("/api/lock/status", "/api/session", "/api/lock/setup"):
+    if request.path in ("/api/lock/status", "/api/session", "/api/lock/setup",
+                         "/api/webauthn/status", "/api/webauthn/auth/begin",
+                         "/api/webauthn/auth/finish"):
         return None
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer ") and secrets.compare_digest(auth_header[7:].strip(), AUTH_TOKEN):
@@ -338,7 +395,9 @@ def _ui_lock_guard():
     path = request.path
     if not path.startswith("/api/"):
         return None
-    if path in ("/api/lock/status", "/api/session", "/api/lock/setup"):
+    if path in ("/api/lock/status", "/api/session", "/api/lock/setup",
+                         "/api/webauthn/status", "/api/webauthn/auth/begin",
+                         "/api/webauthn/auth/finish"):
         return None
     if AUTH_TOKEN:
         ah = request.headers.get("Authorization", "")
@@ -386,6 +445,111 @@ def api_session_create():
     resp = make_response(jsonify({"ok": True}))
     resp.set_cookie(SESSION_COOKIE, _new_session(), httponly=True, samesite="Strict")
     return resp
+
+
+# --------------------------------------------------------------------------- WebAuthn
+# Biometric unlock (Touch ID / Face ID / Windows Hello). This AUGMENTS the master
+# password; it never replaces it, so a lost device can never lock you out.
+# Enrolment requires an already-unlocked session — you cannot bootstrap a credential
+# from a locked app, which is what stops someone at the keyboard enrolling their own
+# finger while you are away.
+
+def _webauthn_rp_and_origin():
+    """Derive the Relying Party ID and expected origin from the request host.
+
+    Two requirements are easy to conflate:
+
+    * SECURE CONTEXT: both http://localhost and http://127.0.0.1 qualify, so either
+      will happily run WebAuthn JavaScript.
+    * VALID RP ID: stricter. An RP ID must be a *domain*, and an IP literal is not one.
+      `localhost` is the single non-registrable name the spec permits. A page served
+      from 127.0.0.1 therefore fails at registration with
+      "SecurityError: The effective domain of the document is not a valid domain",
+      which is why browse_host() opens `localhost` rather than the loopback IP.
+
+    Any loopback address is mapped to `localhost`, so someone who typed the IP by hand
+    still gets a working ceremony as long as the document itself is on localhost.
+    """
+    host = (request.host or f"{LOOPBACK_BROWSE_HOST}:{DEFAULT_PORT}").split(":")[0]
+    if host in ("::1", "0.0.0.0") or host.startswith("127."):
+        host = LOOPBACK_BROWSE_HOST
+    return host, request.headers.get("Origin") or f"{request.scheme}://{request.host}"
+
+
+@app.route("/api/webauthn/status")
+def api_webauthn_status():
+    return jsonify({"enrolled": px_webauthn.is_enrolled(),
+                    "credentials": px_webauthn.list_credentials()})
+
+
+def _webauthn_unusable_reason(rp_id):
+    """Explain, in the user's terms, why a biometric cannot be enrolled here.
+
+    Reached when the app is opened over a LAN address or a container port map. The
+    browser would otherwise throw a bare SecurityError that says nothing actionable.
+    """
+    import ipaddress
+    try:
+        ipaddress.ip_address(rp_id)
+    except ValueError:
+        return None          # a hostname: fine
+    return ("Biometric unlock needs the app opened at http://localhost:%d, not an IP "
+            "address. WebAuthn requires a real domain name, and an IP is not one." % DEFAULT_PORT)
+
+
+@app.route("/api/webauthn/register/begin", methods=["POST"])
+def api_webauthn_register_begin():
+    if not _session_valid(request.cookies.get(SESSION_COOKIE, "")):
+        return jsonify({"error": "Unlock the app before enrolling a biometric"}), 401
+    rp_id, _ = _webauthn_rp_and_origin()
+    reason = _webauthn_unusable_reason(rp_id)
+    if reason:
+        return jsonify({"error": reason}), 400
+    return jsonify(px_webauthn.registration_options(rp_id))
+
+
+@app.route("/api/webauthn/register/finish", methods=["POST"])
+def api_webauthn_register_finish():
+    if not _session_valid(request.cookies.get(SESSION_COOKIE, "")):
+        return jsonify({"error": "Unlock the app before enrolling a biometric"}), 401
+    rp_id, origin = _webauthn_rp_and_origin()
+    try:
+        return jsonify({"ok": True, "credential": px_webauthn.verify_registration(
+            request.json or {}, rp_id, origin)})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/webauthn/auth/begin", methods=["POST"])
+def api_webauthn_auth_begin():
+    if not _lock_enabled():
+        return jsonify({"error": "App lock is not configured"}), 400
+    try:
+        return jsonify(px_webauthn.authentication_options())
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/webauthn/auth/finish", methods=["POST"])
+def api_webauthn_auth_finish():
+    if not _lock_enabled():
+        return jsonify({"error": "App lock is not configured"}), 400
+    rp_id, origin = _webauthn_rp_and_origin()
+    try:
+        cred = px_webauthn.verify_authentication(request.json or {}, rp_id, origin)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 401
+    resp = make_response(jsonify({"ok": True, "credential": cred}))
+    resp.set_cookie(SESSION_COOKIE, _new_session(), httponly=True, samesite="Strict")
+    return resp
+
+
+@app.route("/api/webauthn/credential", methods=["DELETE"])
+def api_webauthn_delete():
+    if not _session_valid(request.cookies.get(SESSION_COOKIE, "")):
+        return jsonify({"error": "Unlock the app first"}), 401
+    cred_id = (request.json or {}).get("id", "")
+    return jsonify({"ok": px_webauthn.delete_credential(cred_id)})
 
 
 @app.route("/api/session", methods=["DELETE"])
@@ -462,12 +626,131 @@ def readyz():
 
 @app.route("/api/vault")
 def api_vault():
-    """Return all secrets grouped by service."""
+    """Return all secrets grouped by service (of the active vault)."""
     try:
         data = decrypt_vault()
         return jsonify(data)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/vaults", methods=["GET"])
+def api_list_vaults():
+    """List named vaults (Issue #21). Each: id, name, agent_access, human_unlock_required."""
+    return jsonify({"vaults": px_vaults.list_vaults()})
+
+
+@app.route("/api/vaults", methods=["POST"])
+def api_create_vault():
+    """Create a named vault with its own recipients + access policy."""
+    guard = _readonly_guard()
+    if guard:
+        return guard
+    body = request.get_json(force=True, silent=True) or {}
+    name = (body.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "name required"}), 400
+    recipients = body.get("recipients") or ([AGE_PUBLIC_KEY] if AGE_PUBLIC_KEY else [])
+    try:
+        vid = px_vaults.create_vault(
+            name, recipients,
+            agent_access=body.get("agent_access", "read_write"),
+            human_unlock_required=bool(body.get("human_unlock_required", False)),
+        )
+    except (ValueError, FileExistsError) as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"ok": True, "id": vid}), 201
+
+
+@app.route("/api/vaults/move", methods=["POST"])
+def api_move_secret():
+    """Move or copy a secret between vaults (Issue #31). Body: src, dst, path[], copy?, dry_run?."""
+    guard = _readonly_guard()
+    if guard:
+        return guard
+    b = request.get_json(force=True, silent=True) or {}
+    src, dst, path = b.get("src"), b.get("dst"), b.get("path")
+    if not (src and dst and isinstance(path, list) and path):
+        return jsonify({"error": "src, dst, path[] required"}), 400
+    try:
+        res = px_vaults.move_secret(src, dst, path, AGE_KEY_FILE,
+                                    copy=bool(b.get("copy")), dry_run=bool(b.get("dry_run")))
+    except KeyError as e:
+        return jsonify({"error": f"not found: {e}"}), 404
+    except (ValueError, FileExistsError) as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"ok": True, "result": res})
+
+
+@app.before_request
+def _vault_policy_guard():
+    """Enforce per-vault agent_access for automation (Bearer) callers on vault-data routes.
+    Humans / the local UI are unrestricted here (still subject to the UI lock). Policy:
+    read_write = full, read = GET/HEAD only, deny = blocked. Legacy single-file mode = no policy."""
+    p = request.path
+    if not (p == "/api/vault" or p.startswith("/api/secret") or p.startswith("/api/note")):
+        return None
+    vid = _active_vault_id()
+    if vid is None:
+        return None
+    if not request.headers.get("Authorization", "").startswith("Bearer "):
+        return None  # not an agent bearer call — treat as human/local
+    policy = px_vaults.read_config(vid).get("agent_access", "read_write")
+    if policy == "read_write" or (policy == "read" and request.method in ("GET", "HEAD")):
+        return None
+    return jsonify({"error": f"vault '{vid}' denies agent {request.method} (agent_access={policy})"}), 403
+
+
+def _walk_to_parent(data: dict, path: list, create: bool = False):
+    """Resolve (parent_dict, leaf_key) for a nested path list (e.g.
+    ["telephony", "master", "auth_token"]). With create=True, builds missing
+    intermediate group dicts. Returns (None, leaf) if an intermediate is missing
+    and create=False. Raises ValueError if an intermediate exists but is not a group."""
+    parent = data
+    for seg in path[:-1]:
+        if seg in parent:
+            if not isinstance(parent[seg], dict):
+                raise ValueError(f"path segment '{seg}' is not a group")
+            parent = parent[seg]
+        elif create:
+            parent[seg] = {}
+            parent = parent[seg]
+        else:
+            return None, path[-1]
+    return parent, path[-1]
+
+
+def _prune_empty_groups(data: dict, segments: list):
+    """Delete now-empty group dicts along `segments`, deepest first — so deleting
+    a nested leaf that empties its tenant (and the service) cleans up, matching
+    the flat-delete behavior of removing an emptied service."""
+    for i in range(len(segments), 0, -1):
+        prefix = segments[:i]
+        node = data
+        ok = True
+        for s in prefix:
+            if isinstance(node, dict) and s in node:
+                node = node[s]
+            else:
+                ok = False
+                break
+        if ok and isinstance(node, dict) and not node:
+            par = data
+            for s in prefix[:-1]:
+                par = par[s]
+            par.pop(prefix[-1], None)
+
+
+def _validate_path(path):
+    """Return an error-response tuple if path is not a clean list of non-empty,
+    non-reserved string segments; else None."""
+    if not isinstance(path, list) or len(path) < 1 or not all(isinstance(s, str) and s for s in path):
+        return jsonify({"error": "Invalid path"}), 400
+    if any(s.endswith("__note") for s in path):
+        return jsonify({"error": "Reserved key suffix '__note'"}), 400
+    return None
 
 
 @app.route("/api/secret", methods=["POST"])
@@ -483,14 +766,33 @@ def api_add_secret():
         return guard
     try:
         body = request.json
-        service = body["service"].strip()
-        key = body["key"]
-        value = body["value"]
-        note = body.get("note", "")
         overwrite = (
             body.get("overwrite") is True
             or request.args.get("overwrite", "").lower() in ("1", "true", "yes")
         )
+        # Nested/path write (e.g. telephony -> tenant -> auth_token). Same vault,
+        # same SOPS-encrypted file as a flat write — just at depth.
+        path = body.get("path")
+        if path is not None:
+            bad = _validate_path(path)
+            if bad:
+                return bad
+            value = body["value"]
+            note = body.get("note", "")
+            data = decrypt_vault()
+            parent, leaf = _walk_to_parent(data, path, create=True)
+            if not overwrite and leaf in parent:
+                return jsonify({"error": "Key already exists. Resend with overwrite=true to replace.", "path": path}), 409
+            parent[leaf] = value
+            if note:
+                parent[f"{leaf}__note"] = note
+            encrypt_vault(data)
+            return jsonify({"ok": True})
+
+        service = body["service"].strip()
+        key = body["key"]
+        value = body["value"]
+        note = body.get("note", "")
 
         data = decrypt_vault()
         service = _resolve_service_case(service, data)
@@ -519,9 +821,22 @@ def api_delete_secret():
         return guard
     try:
         body = request.json
+        data = decrypt_vault()
+        path = body.get("path")
+        if path is not None:
+            bad = _validate_path(path)
+            if bad:
+                return bad
+            parent, leaf = _walk_to_parent(data, path, create=False)
+            if parent is not None:
+                parent.pop(leaf, None)
+                parent.pop(f"{leaf}__note", None)
+                _prune_empty_groups(data, path[:-1])
+            encrypt_vault(data)
+            return jsonify({"ok": True})
+
         service = body["service"].strip()
         key = body["key"]
-        data = decrypt_vault()
         service = _resolve_service_case(service, data)
         if service in data:
             data[service].pop(key, None)
@@ -559,10 +874,25 @@ def api_add_note():
         return guard
     try:
         body = request.json
-        service = body["service"].strip()
-        key = body["key"]
         note = body["note"]
         data = decrypt_vault()
+        path = body.get("path")
+        if path is not None:
+            bad = _validate_path(path)
+            if bad:
+                return bad
+            parent, leaf = _walk_to_parent(data, path, create=False)
+            if parent is None:
+                return jsonify({"error": "Path not found"}), 404
+            if note:
+                parent[f"{leaf}__note"] = note
+            else:
+                parent.pop(f"{leaf}__note", None)
+            encrypt_vault(data)
+            return jsonify({"ok": True})
+
+        service = body["service"].strip()
+        key = body["key"]
         service = _resolve_service_case(service, data)
         if service not in data:
             return jsonify({"error": "Service not found"}), 404
@@ -610,7 +940,7 @@ def api_save_settings():
 def api_open_browser():
     """Open the UI in the system's default browser."""
     port = app.config.get("port", DEFAULT_PORT)
-    webbrowser.open(f"http://{DEFAULT_HOST}:{port}")
+    webbrowser.open(f"http://{browse_host(HOST_OVERRIDE or DEFAULT_HOST)}:{port}")
     return jsonify({"ok": True})
 
 
@@ -959,9 +1289,28 @@ h1{font-size:22px;font-weight:600;color:var(--accent)}
 .icon-btn{background:transparent;border:none;color:var(--muted);font-size:16px;cursor:pointer;padding:4px;transition:color .15s;text-decoration:none;line-height:1}
 .icon-btn:hover{color:var(--accent)}
 .icon-btn[title]:hover::after{content:attr(title)}
-.toolbar{display:flex;gap:6px;margin-bottom:10px;align-items:center}
-.toolbar input[type=text]{flex:1;background:var(--card);border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:6px;font-size:14px;outline:none}
+/* Toolbar wraps instead of overflowing. Before this, a single nowrap flex row pushed
+   Export outside the viewport as soon as the vault switcher became visible. */
+.toolbar{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px;align-items:center}
+.toolbar input[type=text]{flex:1 1 180px;min-width:140px;background:var(--card);border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:6px;font-size:14px;outline:none}
 .toolbar input[type=text]:focus{border-color:var(--accent)}
+/* A vault name can be arbitrarily long: cap and ellipsize it rather than let it
+   dictate the width of the whole toolbar row. */
+#vault-switcher{max-width:170px;background:var(--card);border:1px solid var(--border);color:var(--text);padding:7px 8px;border-radius:6px;font-size:13px;outline:none;text-overflow:ellipsis}
+
+/* Narrow windows: shrink controls, and give search its own full-width row, before
+   anything is ever allowed to overflow. */
+@media (max-width:760px){
+  .toolbar{gap:5px}
+  .toolbar .btn{padding:6px 9px;font-size:12px}
+  #vault-switcher{max-width:130px;font-size:12px}
+  .toolbar input[type=text]{flex:1 1 100%;order:-1}
+}
+@media (max-width:480px){
+  .toolbar .btn{flex:1 1 auto;text-align:center;padding:7px 6px}
+  #vault-switcher{flex:1 1 auto;max-width:none}
+  .header-icons{flex-wrap:wrap}
+}
 .btn{background:transparent;color:var(--text);border:1px solid var(--border);padding:6px 12px;border-radius:6px;cursor:pointer;font-size:13px;white-space:nowrap;transition:all .15s}
 .btn:hover{border-color:var(--accent);color:var(--accent)}
 .btn-accent{border-color:var(--accent);color:var(--accent)}
@@ -987,6 +1336,14 @@ h1{font-size:22px;font-weight:600;color:var(--accent)}
 .key-actions{display:flex;gap:4px;flex-shrink:0}
 .key-note{color:var(--muted);font-style:italic;font-size:12px;margin-top:8px;padding-left:0;cursor:pointer;transition:color .15s}
 .key-note:hover{color:var(--accent)}
+.key-group{margin:4px 0;border-left:2px solid #333;padding-left:8px}
+.key-group-head{display:flex;align-items:center;gap:8px;padding:6px 0;cursor:pointer;user-select:none}
+.key-group-head:hover .group-name{color:var(--accent)}
+.group-name{font-weight:600;font-size:14px;color:#ddd}
+.group-desc{color:var(--muted);font-style:italic;font-size:12px;margin:0 0 4px 20px}
+.key-group-body{display:none;padding-left:12px}
+.key-group-body.open{display:block}
+.ro-tag{color:var(--muted);font-size:11px;font-style:italic;align-self:center;padding:0 4px;border:1px solid #333;border-radius:4px}
 .status-bar{margin-top:12px;color:var(--muted);font-size:13px;text-align:center}
 .cli-ref{margin-top:4px;color:var(--muted);font-size:11px;text-align:center}
 /* Modals */
@@ -1007,6 +1364,9 @@ h1{font-size:22px;font-weight:600;color:var(--accent)}
 .toast-container{position:fixed;bottom:16px;right:16px;z-index:200;display:flex;flex-direction:column;gap:6px}
 .toast{background:rgba(102,187,106,0.15);color:var(--success);border:1px solid rgba(102,187,106,0.3);padding:10px 20px;border-radius:10px;font-size:13px;opacity:0;transform:translateY(10px);transition:all .3s;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);pointer-events:none}
 .toast.show{opacity:1;transform:translateY(0)}
+/* Failures were rendering in the success green, which reads as "it worked" at a
+   glance and is exactly backwards. Errors get the danger colour. */
+.toast.toast-error{background:rgba(229,83,75,0.15);color:var(--danger);border-color:rgba(229,83,75,0.35)}
 /* Generator */
 .gen-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px;max-height:55vh;overflow-y:auto;padding-right:4px}
 .gen-category{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:10px}
@@ -1036,6 +1396,9 @@ h1{font-size:22px;font-weight:600;color:var(--accent)}
     <input id="lock-pass2" type="password" placeholder="Confirm password" autocomplete="off" style="display:none" onkeydown="if(event.key==='Enter')lockSubmit()">
     <div id="lock-err" style="color:#e5534b;font-size:12px;min-height:15px;margin:2px 0"></div>
     <button class="btn btn-accent" style="width:100%" id="lock-btn" onclick="lockSubmit()">Unlock</button>
+    <!-- Only rendered when an authenticator is enrolled. The master password stays
+         above as the recovery path, so a lost device can never lock you out. -->
+    <button class="btn" style="width:100%;margin-top:8px;display:none" id="bio-btn" onclick="bioUnlock()">&#128075; Unlock with Touch ID / Face ID</button>
   </div>
 </div>
 
@@ -1052,6 +1415,8 @@ h1{font-size:22px;font-weight:600;color:var(--accent)}
 </div>
 
 <div class="toolbar">
+  <select id="vault-switcher" onchange="switchVault(this.value)" title="Active vault" style="display:none"></select>
+  <button class="btn" onclick="createVaultPrompt()" title="Create a new vault">+ Vault</button>
   <input type="text" id="search" placeholder="Search services or keys...">
   <button class="btn btn-accent" onclick="showAddModal()">+ Add</button>
   <button class="btn" onclick="loadVault()">Refresh</button>
@@ -1072,9 +1437,13 @@ h1{font-size:22px;font-weight:600;color:var(--accent)}
     <h2 id="add-modal-title">Add Secret</h2>
     <label>Service</label>
     <div class="svc-chips" id="svc-chips"></div>
-    <input id="add-service" placeholder="New service or click one above" style="margin-top:6px">
+    <input id="add-service" placeholder="New service or click one above" style="margin-top:6px" oninput="updatePathPreview()">
+    <label>Group <span style="font-weight:400;color:var(--muted)">(optional)</span></label>
+    <div style="font-size:11px;color:var(--muted);margin:2px 0 4px">Nest the key inside a group instead of putting it directly under the service. Use <code>/</code> to go deeper.</div>
+    <input id="add-group" placeholder="e.g. alice   or   eu / tenant-1" oninput="updatePathPreview()">
     <label>Key Name</label>
-    <input id="add-key" placeholder="e.g. access_key_id">
+    <input id="add-key" placeholder="e.g. access_key_id" oninput="updatePathPreview()">
+    <div id="add-path-preview" class="mono" style="font-size:11px;color:var(--muted);margin-top:5px;min-height:14px"></div>
     <label>Value</label>
     <input id="add-value" type="password" placeholder="secret value">
     <label>Note (optional)</label>
@@ -1111,6 +1480,13 @@ h1{font-size:22px;font-weight:600;color:var(--accent)}
         <button class="btn" id="lock-enable-btn" onclick="closeModal('settings-modal');enableLock()">Enable</button>
         <button class="btn btn-danger" id="lock-disable-btn" onclick="disableLock()" style="display:none">Disable</button>
         <span id="lock-state" style="font-size:12px;color:var(--muted)"></span>
+      </div>
+      <label style="margin-top:12px">Biometric Unlock</label>
+      <div style="font-size:11px;color:var(--muted);margin:2px 0 8px">Unlock with Touch&nbsp;ID, Face&nbsp;ID or Windows&nbsp;Hello instead of typing the master password every time. The key never leaves this device's secure enclave, and the password always stays available as a fallback.</div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button class="btn" id="bio-enroll-btn" onclick="bioEnroll()" style="display:none">Enable biometric</button>
+        <button class="btn btn-danger" id="bio-remove-btn" onclick="bioRemove()" style="display:none">Remove</button>
+        <span id="bio-state" style="font-size:12px;color:var(--muted)"></span>
       </div>
     </div>
     <label>Vault File Path</label>
@@ -1252,6 +1628,138 @@ let revealedKeys = {};
   };
 })();
 let openCards = new Set();
+let openGroups = new Set();
+
+// ---- Biometric unlock (Touch ID / Face ID / Windows Hello) ----
+// Base64URL <-> ArrayBuffer, because WebAuthn speaks ArrayBuffer and JSON does not.
+function _b64uToBuf(s){
+  const pad = '='.repeat((4 - s.length % 4) % 4);
+  const bin = atob((s + pad).replace(/-/g,'+').replace(/_/g,'/'));
+  const b = new Uint8Array(bin.length);
+  for (let i=0;i<bin.length;i++) b[i] = bin.charCodeAt(i);
+  return b.buffer;
+}
+function _bufToB64u(buf){
+  const b = new Uint8Array(buf); let s = '';
+  for (let i=0;i<b.length;i++) s += String.fromCharCode(b[i]);
+  return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+}
+function bioSupported(){
+  return !!(window.PublicKeyCredential && navigator.credentials && navigator.credentials.create);
+}
+
+// The WebAuthn API existing is NOT the same as a usable fingerprint/face sensor.
+// Embedded webviews and "add to dock" web apps expose the API but have no platform
+// authenticator behind it, so navigator.credentials.create() rejects instantly with
+// NotAllowedError — indistinguishable from the user hitting Cancel. Ask first.
+async function bioPlatformAvailable(){
+  if (!bioSupported()) return false;
+  try {
+    return await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
+  } catch(e){ return false; }
+}
+
+// Reveal the lock-screen biometric button only when something is actually enrolled.
+async function refreshBioUI(){
+  const btn = document.getElementById('bio-btn');
+  const st  = document.getElementById('bio-state');
+  const enr = document.getElementById('bio-enroll-btn');
+  const rem = document.getElementById('bio-remove-btn');
+  let d = {enrolled:false, credentials:[]};
+  try { d = await (await window.fetch('/api/webauthn/status')).json(); } catch(e){}
+  const hasApi = bioSupported();
+  const usable = await bioPlatformAvailable();
+  if (btn) btn.style.display = (d.enrolled && usable) ? '' : 'none';
+  if (st){
+    if (!hasApi)       st.textContent = 'Not supported by this browser';
+    else if (!usable)  st.textContent = 'Unavailable in this window. The native window is a WKWebView, and macOS does not grant platform-authenticator access to an embedded webview, so Touch ID cannot be offered here. Open the app in your browser (globe icon) and enrol there.';
+    else if (d.enrolled) st.textContent = 'ON — ' + d.credentials.map(c=>c.label).join(', ');
+    else               st.textContent = 'OFF';
+  }
+  if (enr) enr.style.display = (usable && !d.enrolled) ? '' : 'none';
+  if (rem) rem.style.display = d.enrolled ? '' : 'none';
+  return d;
+}
+
+async function bioUnlock(){
+  const err = document.getElementById('lock-err');
+  try {
+    const opts = await (await window.fetch('/api/webauthn/auth/begin', {method:'POST'})).json();
+    if (opts.error){ if(err) err.textContent = opts.error; return; }
+    const assertion = await navigator.credentials.get({publicKey: {
+      challenge: _b64uToBuf(opts.challenge),
+      timeout: opts.timeout,
+      userVerification: opts.userVerification,
+      allowCredentials: (opts.allowCredentials||[]).map(c=>({type:'public-key', id:_b64uToBuf(c.id)})),
+    }});
+    const r = await (await window.fetch('/api/webauthn/auth/finish', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        id: assertion.id,
+        clientDataJSON:    _bufToB64u(assertion.response.clientDataJSON),
+        authenticatorData: _bufToB64u(assertion.response.authenticatorData),
+        signature:         _bufToB64u(assertion.response.signature),
+      })})).json();
+    if (r.error){ if(err) err.textContent = r.error; return; }
+    hideLockScreen(); startIdleWatch(); await loadVaults(); loadVault();
+  } catch(e){
+    // A user cancelling the prompt is not an error worth shouting about.
+    if (err) err.textContent = (e && e.name === 'NotAllowedError') ? 'Biometric cancelled' : ('Biometric failed: ' + e);
+  }
+}
+
+async function bioEnroll(){
+  // Check for a real sensor first. Without this, an embedded webview rejects with
+  // NotAllowedError and the user just sees "Enrolment cancelled" forever, with no
+  // hint that the window itself is the problem rather than their finger.
+  if (!(await bioPlatformAvailable())){
+    // Offer the way out rather than just refusing: the native window cannot do this,
+    // but the same app in a browser can, and we already have an endpoint for that.
+    toast('Touch ID is not available in this window. Opening the app in your browser so you can enrol there.', 'error');
+    try { await window.fetch('/api/open-browser'); } catch(e){}
+    return;
+  }
+  try {
+    const opts = await (await window.fetch('/api/webauthn/register/begin', {method:'POST'})).json();
+    if (opts.error){ toast(opts.error, 'error'); return; }
+    const cred = await navigator.credentials.create({publicKey: {
+      challenge: _b64uToBuf(opts.challenge),
+      rp: opts.rp,
+      user: {id:_b64uToBuf(opts.user.id), name:opts.user.name, displayName:opts.user.displayName},
+      pubKeyCredParams: opts.pubKeyCredParams,
+      timeout: opts.timeout,
+      attestation: opts.attestation,
+      authenticatorSelection: opts.authenticatorSelection,
+      excludeCredentials: (opts.excludeCredentials||[]).map(c=>({type:'public-key', id:_b64uToBuf(c.id)})),
+    }});
+    // getPublicKey() hands us SPKI DER directly — no CBOR attestation parsing needed.
+    const spki = cred.response.getPublicKey ? cred.response.getPublicKey() : null;
+    if (!spki){ toast('This browser cannot export the public key (needs a newer version)', 'error'); return; }
+    const r = await (await window.fetch('/api/webauthn/register/finish', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        id: cred.id,
+        clientDataJSON: _bufToB64u(cred.response.clientDataJSON),
+        publicKey: _bufToB64u(spki),
+        label: (navigator.platform || 'this device'),
+      })})).json();
+    if (r.error){ toast(r.error, 'error'); return; }
+    toast('Biometric unlock enabled');
+    await refreshBioUI();
+  } catch(e){
+    toast((e && e.name === 'NotAllowedError') ? 'Enrolment cancelled' : ('Enrolment failed: ' + e), 'error');
+  }
+}
+
+async function bioRemove(){
+  const d = await (await window.fetch('/api/webauthn/status')).json();
+  for (const c of (d.credentials||[])){
+    await window.fetch('/api/webauthn/credential', {method:'DELETE',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({id:c.id})});
+  }
+  toast('Biometric unlock removed');
+  await refreshBioUI();
+}
 
 // ---- App lock (issue #19): master-password gate + idle auto-lock ----
 let _lockMode = 'unlock';
@@ -1269,6 +1777,7 @@ async function refreshLockUI(){
   if (en) en.style.display = st.enabled ? 'none' : '';
   if (dis) dis.style.display = st.enabled ? '' : 'none';
   if (ls) ls.textContent = st.enabled ? ('ON — auto-locks after ' + Math.round((st.idle_timeout_s||300)/60) + ' min idle') : 'OFF';
+  refreshBioUI();
   return st;
 }
 
@@ -1299,11 +1808,15 @@ async function lockSubmit(){
     if (pass !== pass2){ err.textContent = 'Passwords do not match'; return; }
     const d = await (await fetch('/api/lock/setup', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({password:pass})})).json();
     if (d.error){ err.textContent = d.error; return; }
-    hideLockScreen(); await refreshLockUI(); startIdleWatch(); toast('App lock enabled'); loadVault();
+    // loadVaults() must run here too: initApp() returns early while the app is
+    // locked, so this is the only place the vault switcher gets populated after
+    // an unlock. Without it the switcher stays display:none and the user can
+    // create vaults but never see or switch between them.
+    hideLockScreen(); await refreshLockUI(); startIdleWatch(); toast('App lock enabled'); await loadVaults(); loadVault();
   } else {
     const d = await (await fetch('/api/session', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({password:pass})})).json();
     if (d.error){ err.textContent = d.error || 'Incorrect password'; return; }
-    hideLockScreen(); startIdleWatch(); loadVault();
+    hideLockScreen(); startIdleWatch(); await loadVaults(); loadVault();
   }
 }
 
@@ -1330,16 +1843,67 @@ function startIdleWatch(){
   reset();
 }
 
+// --- multi-vault (Issue #21): active vault + X-Vault header on data calls ---
+let currentVault = null;
+function vfetch(url, opts){
+  opts = opts || {};
+  opts.headers = Object.assign({}, opts.headers || {}, currentVault ? {'X-Vault': currentVault} : {});
+  return fetch(url, opts);
+}
+async function loadVaults(){
+  try {
+    const d = await (await fetch('/api/vaults')).json();
+    const vs = d.vaults || [];
+    const sel = document.getElementById('vault-switcher');
+    if (!sel) return;
+    if (!vs.length){ sel.style.display='none'; currentVault = null; return; }
+    if (!currentVault || !vs.find(v=>v.id===currentVault))
+      currentVault = (vs.find(v=>v.id==='default') || vs[0]).id;
+    sel.innerHTML = vs.map(v =>
+      `<option value="${v.id}"${v.id===currentVault?' selected':''}>${v.name}${v.agent_access==='deny'?' \u{1F512}':''}</option>`
+    ).join('');
+    sel.style.display='';
+  } catch(e){
+    // Never swallow this silently: an empty catch here is why a hidden switcher
+    // looked like "the feature does not exist" instead of "the call failed".
+    console.error('loadVaults failed:', e);
+    toast('Could not load vault list: ' + (e && e.message ? e.message : e), 'error');
+  }
+}
+async function switchVault(id){ currentVault = id; await loadVault(); }
+async function createVaultPrompt(){
+  const name = prompt('New vault name (e.g. Work, Personal):');
+  if (!name) return;
+  const d = await (await fetch('/api/vaults', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name})})).json();
+  if (d.error){ toast(d.error); return; }
+  currentVault = d.id;
+  toast('Vault "' + name + '" created');
+  await loadVaults();
+  await loadVault();
+}
+
+// CSS cannot rewrite a placeholder, so shorten it in JS on narrow viewports.
+// "Search services or keys..." is the single widest item in the toolbar.
+function adaptSearchPlaceholder(){
+  const s = document.getElementById('search');
+  if (!s) return;
+  const w = window.innerWidth;
+  s.placeholder = w < 480 ? 'Search...' : (w < 760 ? 'Search keys...' : 'Search services or keys...');
+}
+window.addEventListener('resize', adaptSearchPlaceholder);
+
 async function initApp(){
+  adaptSearchPlaceholder();
   const st = await refreshLockUI();
   if (st.enabled && st.locked){ showLockScreen(st, 'unlock'); return; }
   if (st.enabled){ startIdleWatch(); }
+  await loadVaults();
   loadVault();
 }
 
 async function loadVault() {
   try {
-    const r = await fetch('/api/vault');
+    const r = await vfetch('/api/vault');
     const d = await r.json();
     if (d.error) { toast(d.error); return; }
     vaultData = d;
@@ -1347,77 +1911,157 @@ async function loadVault() {
   } catch(e) { toast('Failed to load vault'); }
 }
 
-function render() {
-  const q = document.getElementById('search').value.toLowerCase();
-  const container = document.getElementById('cards');
-  container.innerHTML = '';
-  let svcCount = 0, keyCount = 0;
-  const services = Object.keys(vaultData).sort();
-  for (const svc of services) {
-    const keys = Object.keys(vaultData[svc]).filter(k => !k.endsWith('__note'));
-    const filteredKeys = keys.filter(k => {
-      if (!q) return true;
-      return svc.toLowerCase().includes(q) || k.toLowerCase().includes(q);
-    });
-    if (q && filteredKeys.length === 0 && !svc.toLowerCase().includes(q)) continue;
-    const displayKeys = q ? filteredKeys : keys;
-    svcCount++;
-    keyCount += displayKeys.length;
+function valIsObject(v){ return v !== null && typeof v === 'object' && !Array.isArray(v); }
+// Walk vaultData along an array path [svc, ...keys]. No string parsing, so key
+// names containing the legacy '::' separator can never resolve the wrong node.
+function resolveByPath(path){
+  let cur = vaultData;
+  for (const s of path){ if (cur == null) return undefined; cur = cur[s]; }
+  return cur;
+}
+// Stable, unambiguous UI-state key for a path (arrays of strings serialize 1:1).
+function pkey(path){ return JSON.stringify(path); }
 
-    const card = document.createElement('div');
-    card.className = 'card';
-    const headerId = 'svc-' + svc.replace(/[^a-zA-Z0-9]/g, '_');
-    const isOpen = openCards.has(headerId);
+// Count scalar leaves under obj. 'description' is metadata only when nested (a
+// group caption); at the flat service level (depth 1) it is a normal key.
+function countLeaves(obj, depth){
+  let n = 0;
+  for (const k of Object.keys(obj)){
+    if (k.endsWith('__note')) continue;
+    if (depth > 1 && k === 'description') continue;
+    if (valIsObject(obj[k])) n += countLeaves(obj[k], depth + 1); else n += 1;
+  }
+  return n;
+}
+// Match a query against key names + description/note TEXT only — never against
+// secret values (matching values would silently reveal whether a value contains q).
+function groupMatches(obj, q){
+  for (const k of Object.keys(obj)){
+    if (k.toLowerCase().includes(q)) return true;
+    const v = obj[k];
+    if (valIsObject(v)){ if (groupMatches(v, q)) return true; }
+    else if (typeof v === 'string' && (k === 'description' || k.endsWith('__note')) && v.toLowerCase().includes(q)) return true;
+  }
+  return false;
+}
 
-    let headerHTML = `<div class="card-header" onclick="toggleCard('${headerId}')">
-      <span class="arrow ${isOpen ? 'open' : ''}" id="arrow-${headerId}">&#9654;</span>
-      <span class="svc-name">${esc(svc)}</span>
-      <span class="key-count">${displayKeys.length} key${displayKeys.length!==1?'s':''}</span>
-      <button class="btn btn-danger btn-sm" onclick="event.stopPropagation();deleteService('${esc(svc)}')">Del</button>
-    </div>`;
+// Per-render registry: integer id -> structured path array. Reset every render().
+// All interactions are wired through ONE delegated click handler that reads the
+// integer data-idx and looks up the path here — NO secret/key/service text is ever
+// interpolated into an onclick / JS-string sink. This removes the HTML-attribute
+// breakout XSS class entirely AND the '::'/gid string-collision hazards.
+let renderPaths = [];
 
-    let bodyHTML = `<div class="card-body ${isOpen ? 'open' : ''}" id="body-${headerId}">`;
-    for (const k of displayKeys) {
-      const noteKey = k + '__note';
-      const note = vaultData[svc][noteKey] || '';
-      const val = vaultData[svc][k];
-      const rid = svc + '::' + k;
-      const shown = revealedKeys[rid];
+// Recursively render an object's entries. pathArr = segments from service to obj.
+// depth 1 = service-level (flat secrets keep full CRUD); depth>1 = nested provider
+// structures, rendered read-only (Show/Copy) — writes stay in SOPS, the source of truth.
+function renderEntries(obj, pathArr, depth){
+  if (depth > 8) return '';  // guard against pathological nesting depth
+  let html = '';
+  // 'description' is the group caption (shown above the rows) only when nested.
+  const keys = Object.keys(obj).filter(k => !k.endsWith('__note') && !(depth > 1 && k === 'description'));
+  for (const k of keys){
+    const val = obj[k];
+    const path = pathArr.concat([k]);
+    const idx = renderPaths.push(path) - 1;
+    if (valIsObject(val)){
+      const childKeys = Object.keys(val).filter(x => !x.endsWith('__note') && x !== 'description');
+      const desc = (typeof val.description === 'string') ? val.description : '';
+      const gOpen = openGroups.has(pkey(path));
+      html += `<div class="key-group">
+        <div class="key-group-head" data-act="group" data-idx="${idx}">
+          <span class="arrow ${gOpen ? 'open' : ''}">&#9654;</span>
+          <span class="group-name">${esc(k)}</span>
+          <span class="key-count">${childKeys.length} field${childKeys.length!==1?'s':''}</span>
+        </div>
+        ${desc ? `<div class="group-desc">${esc(desc)}</div>` : ''}
+        <div class="key-group-body ${gOpen ? 'open' : ''}">
+          ${renderEntries(val, path, depth + 1)}
+        </div>
+      </div>`;
+    } else {
+      const note = obj[k + '__note'] || '';
+      const shown = revealedKeys[pkey(path)];
       const displayVal = shown ? esc(String(val)) : '••••••••';
-      bodyHTML += `<div class="key-row">
+      html += `<div class="key-row">
         <div class="key-top">
           <span class="key-name">${esc(k)}</span>
           <span class="key-value ${shown ? 'revealed' : ''}">${displayVal}</span>
           <span class="key-actions">
-            <button class="btn btn-sm" onclick="event.stopPropagation();toggleReveal('${escAttr(rid)}')">${shown ? 'Hide' : 'Show'}</button>
-            <button class="btn btn-sm" onclick="event.stopPropagation();copyVal('${escAttr(svc)}','${escAttr(k)}')">Copy</button>
-            <button class="btn btn-sm" onclick="event.stopPropagation();showEditModal('${escAttr(svc)}','${escAttr(k)}')">Edit</button>
-            <button class="btn btn-sm" onclick="event.stopPropagation();showNoteModal('${escAttr(svc)}','${escAttr(k)}')">Note</button>
-            <button class="btn btn-danger btn-sm" onclick="event.stopPropagation();deleteKey('${escAttr(svc)}','${escAttr(k)}')">Del</button>
+            <button class="btn btn-sm" data-act="reveal" data-idx="${idx}">${shown ? 'Hide' : 'Show'}</button>
+            <button class="btn btn-sm" data-act="copy" data-idx="${idx}">Copy</button>
+            <button class="btn btn-sm" data-act="edit" data-idx="${idx}">Edit</button>
+            <button class="btn btn-sm" data-act="note" data-idx="${idx}">Note</button>
+            <button class="btn btn-danger btn-sm" data-act="del" data-idx="${idx}">Del</button>
           </span>
         </div>
-        ${note ? `<div class="key-note" onclick="event.stopPropagation();showNoteModal('${escAttr(svc)}','${escAttr(k)}')">${esc(note)}</div>` : ''}
+        ${note ? `<div class="key-note" data-act="note" data-idx="${idx}">${esc(note)}</div>` : ''}
       </div>`;
     }
+  }
+  return html;
+}
+
+function render() {
+  const q = document.getElementById('search').value.toLowerCase();
+  const container = document.getElementById('cards');
+  container.innerHTML = '';
+  renderPaths = [];
+  let svcCount = 0, keyCount = 0;
+  const services = Object.keys(vaultData).sort();
+  for (const svc of services) {
+    if (q && !svc.toLowerCase().includes(q) && !groupMatches(vaultData[svc], q)) continue;
+    svcCount++;
+    const leaves = countLeaves(vaultData[svc], 1);
+    keyCount += leaves;
+
+    const card = document.createElement('div');
+    card.className = 'card';
+    const cidx = renderPaths.push([svc]) - 1;
+    const isOpen = openCards.has(svc);
+
+    let headerHTML = `<div class="card-header" data-act="card" data-idx="${cidx}">
+      <span class="arrow ${isOpen ? 'open' : ''}">&#9654;</span>
+      <span class="svc-name">${esc(svc)}</span>
+      <span class="key-count">${leaves} key${leaves!==1?'s':''}</span>
+      <button class="btn btn-danger btn-sm" data-act="delsvc" data-idx="${cidx}">Del</button>
+    </div>`;
+
+    let bodyHTML = `<div class="card-body ${isOpen ? 'open' : ''}">`;
+    bodyHTML += renderEntries(vaultData[svc], [svc], 1);
     bodyHTML += '</div>';
     card.innerHTML = headerHTML + bodyHTML;
     container.appendChild(card);
   }
-  document.getElementById('status-bar').textContent = `${svcCount} service${svcCount!==1?'s':''}, ${keyCount} key${keyCount!==1?'s':''} \u2014 encrypted with AGE`;
+  document.getElementById('status-bar').textContent = `${svcCount} service${svcCount!==1?'s':''}, ${keyCount} key${keyCount!==1?'s':''} — encrypted with AGE`;
   updateServiceHints();
 }
 
-function toggleCard(id) {
-  const body = document.getElementById('body-' + id);
-  const arrow = document.getElementById('arrow-' + id);
-  body.classList.toggle('open');
-  arrow.classList.toggle('open');
-  if (openCards.has(id)) openCards.delete(id); else openCards.add(id);
-}
-
-function toggleReveal(rid) {
-  revealedKeys[rid] = !revealedKeys[rid];
-  render();
+// Single delegated handler for every vault interaction. It reads the integer
+// data-idx, looks up the structured path, and dispatches by data-act. Because the
+// handler is bound to the (stable) #cards container, it survives the innerHTML
+// rebuilds that render() performs on each toggle.
+async function onCardsClick(e){
+  const el = e.target.closest('[data-act]');
+  if (!el) return;
+  const act = el.dataset.act;
+  const path = renderPaths[+el.dataset.idx];
+  if (!path) return;
+  if (act === 'card'){ if (openCards.has(path[0])) openCards.delete(path[0]); else openCards.add(path[0]); render(); return; }
+  if (act === 'group'){ const pk = pkey(path); if (openGroups.has(pk)) openGroups.delete(pk); else openGroups.add(pk); render(); return; }
+  if (act === 'reveal'){ const pk = pkey(path); revealedKeys[pk] = !revealedKeys[pk]; render(); return; }
+  if (act === 'copy'){
+    const v = resolveByPath(path);
+    if (v === undefined || valIsObject(v)) { toast('Cannot copy a group'); return; }
+    await navigator.clipboard.writeText(String(v));
+    toast('Copied to clipboard — auto-clears in ' + (CLIPBOARD_CLEAR_MS / 1000) + 's');
+    setTimeout(() => navigator.clipboard.writeText('').catch(()=>{}), CLIPBOARD_CLEAR_MS);
+    return;
+  }
+  if (act === 'edit'){ showEditModal(path); return; }
+  if (act === 'note'){ showNoteModal(path); return; }
+  if (act === 'del'){ deleteKey(path); return; }
+  if (act === 'delsvc'){ deleteService(path[0]); return; }
 }
 
 async function copyVal(svc, key) {
@@ -1432,14 +2076,23 @@ function updateServiceHints() {
   if (!chips) return;
   const services = Object.keys(vaultData).sort();
   chips.innerHTML = services.map(s =>
-    `<span class="svc-chip" onclick="document.getElementById('add-service').value='${esc(s)}'">${esc(s)}</span>`
+    `<span class="svc-chip" onclick="document.getElementById('add-service').value='${escAttr(s)}'">${esc(s)}</span>`
   ).join('');
 }
 
 let editMode = false;
+let editPath = null;   // full path array of the secret being edited (flat or nested)
+let notePath = null;   // full path array for the note modal
+// Resolve the existing note text for a leaf path: parent[leaf + '__note'].
+function noteAt(path){
+  const parent = resolveByPath(path.slice(0, -1));
+  const leaf = path[path.length - 1];
+  return (parent && parent[leaf + '__note']) || '';
+}
 
 function showAddModal() {
   editMode = false;
+  editPath = null;
   document.getElementById('add-modal-title').textContent = 'Add Secret';
   document.getElementById('add-service').value = '';
   document.getElementById('add-key').value = '';
@@ -1448,19 +2101,38 @@ function showAddModal() {
   document.getElementById('add-service').readOnly = false;
   document.getElementById('add-key').readOnly = false;
   document.getElementById('add-value').placeholder = 'secret value';
+  setGroupFieldVisible(true);
   updateServiceHints();
+  updatePathPreview();
   document.getElementById('add-modal').classList.add('show');
   document.getElementById('add-service').focus();
 }
 
-function showEditModal(svc, key) {
+// The group field only makes sense when creating. Editing targets an existing
+// path, so showing it there would imply you can move a secret from this modal.
+function setGroupFieldVisible(show){
+  const inp = document.getElementById('add-group');
+  if (!inp) return;
+  if (!show) inp.value = '';
+  // label + hint + input are the three nodes that belong to this field
+  const hint = inp.previousElementSibling;
+  const label = hint ? hint.previousElementSibling : null;
+  [inp, hint, label].forEach(n => { if (n) n.style.display = show ? '' : 'none'; });
+  const prev = document.getElementById('add-path-preview');
+  if (prev && !show) prev.textContent = '';
+}
+
+function showEditModal(path) {
   editMode = true;
+  editPath = path;
+  setGroupFieldVisible(false);
   document.getElementById('add-modal-title').textContent = 'Edit Secret';
-  document.getElementById('add-service').value = svc;
-  document.getElementById('add-key').value = key;
+  // Location is read-only (edit value/note only). For nested paths the parent
+  // chain is shown as "service / tenant" and the leaf key separately.
+  document.getElementById('add-service').value = path.slice(0, -1).join(' / ');
+  document.getElementById('add-key').value = path[path.length - 1];
   document.getElementById('add-value').value = '';
-  const noteKey = key + '__note';
-  document.getElementById('add-note').value = (vaultData[svc] && vaultData[svc][noteKey]) || '';
+  document.getElementById('add-note').value = noteAt(path);
   document.getElementById('add-service').readOnly = true;
   document.getElementById('add-key').readOnly = true;
   document.getElementById('add-value').placeholder = 'new value (replaces current)';
@@ -1468,15 +2140,42 @@ function showEditModal(svc, key) {
   document.getElementById('add-value').focus();
 }
 
+// "alice", "eu/tenant-1" and "eu / tenant-1" all mean the same nesting.
+function addGroupSegments(){
+  const g = document.getElementById('add-group');
+  if (!g) return [];
+  return g.value.split('/').map(s => s.trim()).filter(Boolean);
+}
+
+// Show exactly where the secret will land, so nesting is not guesswork.
+function updatePathPreview(){
+  const el = document.getElementById('add-path-preview');
+  if (!el) return;
+  const svc = (document.getElementById('add-service') || {}).value || '';
+  const key = (document.getElementById('add-key') || {}).value || '';
+  const parts = [svc.trim(), ...addGroupSegments(), key.trim()].filter(Boolean);
+  el.textContent = parts.length > 1 ? 'Will be saved as:  ' + parts.join(' › ') : '';
+}
+
 async function addSecret() {
-  const svc = document.getElementById('add-service').value.trim();
-  const key = document.getElementById('add-key').value.trim();
   const val = document.getElementById('add-value').value;
   const note = document.getElementById('add-note').value.trim();
-  if (!svc || !key || !val) { toast('Service, key, and value are required'); return; }
-  const payload = {service:svc, key, value:val, note};
-  if (editMode) payload.overwrite = true;
-  const r = await fetch('/api/secret', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+  let payload;
+  if (editMode && editPath) {
+    if (!val) { toast('A new value is required'); return; }
+    payload = {path: editPath, value: val, note, overwrite: true};
+  } else {
+    const svc = document.getElementById('add-service').value.trim();
+    const key = document.getElementById('add-key').value.trim();
+    if (!svc || !key || !val) { toast('Service, key, and value are required', 'error'); return; }
+    const groups = addGroupSegments();
+    // The API takes an explicit path list for nested writes and creates the
+    // intermediate levels, so a brand-new group needs no separate setup step.
+    payload = groups.length
+      ? {path: [svc, ...groups, key], value: val, note}
+      : {service: svc, key, value: val, note};
+  }
+  const r = await vfetch('/api/secret', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
   const d = await r.json();
   if (d.error) { toast(d.error); return; }
   closeModal('add-modal');
@@ -1497,10 +2196,10 @@ function showConfirm(msg) {
   });
 }
 
-async function deleteKey(svc, key) {
-  const ok = await showConfirm(`Delete ${svc}.${key}?`);
+async function deleteKey(path) {
+  const ok = await showConfirm(`Delete ${path.join(' / ')}?`);
   if (!ok) return;
-  const r = await fetch('/api/secret', {method:'DELETE', headers:{'Content-Type':'application/json'}, body:JSON.stringify({service:svc,key})});
+  const r = await vfetch('/api/secret', {method:'DELETE', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path})});
   const d = await r.json();
   if (d.error) { toast(d.error); return; }
   toast('Secret deleted successfully');
@@ -1510,26 +2209,23 @@ async function deleteKey(svc, key) {
 async function deleteService(svc) {
   const ok = await showConfirm(`Delete entire service "${svc}" and all its keys?`);
   if (!ok) return;
-  const r = await fetch('/api/service/' + encodeURIComponent(svc), {method:'DELETE'});
+  const r = await vfetch('/api/service/' + encodeURIComponent(svc), {method:'DELETE'});
   const d = await r.json();
   if (d.error) { toast(d.error); return; }
   toast('Service and all keys deleted successfully');
   loadVault();
 }
 
-function showNoteModal(svc, key) {
-  document.getElementById('note-service').value = svc;
-  document.getElementById('note-key').value = key;
-  const noteKey = key + '__note';
-  document.getElementById('note-text').value = (vaultData[svc] && vaultData[svc][noteKey]) || '';
+function showNoteModal(path) {
+  notePath = path;
+  document.getElementById('note-text').value = noteAt(path);
   document.getElementById('note-modal').classList.add('show');
 }
 
 async function saveNote() {
-  const svc = document.getElementById('note-service').value;
-  const key = document.getElementById('note-key').value;
+  if (!notePath) { toast('No secret selected'); return; }
   const note = document.getElementById('note-text').value.trim();
-  const r = await fetch('/api/note', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({service:svc,key,note})});
+  const r = await vfetch('/api/note', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path: notePath, note})});
   const d = await r.json();
   if (d.error) { toast(d.error); return; }
   closeModal('note-modal');
@@ -1580,10 +2276,15 @@ function toggleMasked(inputId, eyeId) {
   else { el.type = 'password'; btn.style.color = ''; }
 }
 
-function toast(msg) {
+// kind: 'ok' (default) or 'error'. Callers that report a failure MUST pass 'error',
+// otherwise the message renders in success green and reads as if it worked.
+function toast(msg, kind) {
   const c = document.getElementById('toasts');
   const t = document.createElement('div');
-  t.className = 'toast';
+  // Heuristic safety net for existing call sites that never learned about `kind`:
+  // if the text plainly announces a failure, colour it as one.
+  const looksBad = /\b(fail(ed|ure)?|error|denied|cannot|could not|invalid|unable|refused|not supported)\b/i.test(String(msg));
+  t.className = 'toast' + ((kind === 'error' || (kind === undefined && looksBad)) ? ' toast-error' : '');
   t.textContent = msg;
   c.appendChild(t);
   requestAnimationFrame(() => t.classList.add('show'));
@@ -1591,9 +2292,16 @@ function toast(msg) {
 }
 
 function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
-function escAttr(s) { return s.replace(/\\/g,'\\\\').replace(/'/g,"\\'"); }
+// Escape a value used as a JS string literal inside a DOUBLE-quoted HTML attribute
+// (e.g. onclick="fn('VALUE')"). Two layers: JS-string-escape (\\ and ') FIRST, then
+// HTML-attribute-escape (&, ", <, >) so the value cannot break out of the attribute
+// or the JS string. The browser HTML-decodes the entities back to literals inside the
+// (single-quoted) JS string, where they are harmless. Vault rows no longer use this
+// (they go through data-idx + delegated dispatch); kept for the generator's inline onclick.
+function escAttr(s) { return String(s).replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
 document.getElementById('search').addEventListener('input', render);
+document.getElementById('cards').addEventListener('click', onCardsClick);
 
 // Close modals on overlay click
 document.querySelectorAll('.modal-overlay').forEach(el => {
@@ -1886,7 +2594,9 @@ def main():
 
         webview.create_window(
             APP_NAME,
-            f"http://{host}:{port}",
+            # browse_host(): loopback becomes "localhost" so WebAuthn works, but a
+            # deliberate LAN bind is preserved so the window points at a live socket.
+            f"http://{browse_host(host)}:{port}",
             width=NATIVE_WINDOW_WIDTH,
             height=NATIVE_WINDOW_HEIGHT,
         )

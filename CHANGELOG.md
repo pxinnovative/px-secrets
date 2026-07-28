@@ -6,6 +6,45 @@ Format: [Keep a Changelog](https://keepachangelog.com/). Versions follow [Semant
 
 ---
 
+## [1.9.0] — 2026-07-22
+
+### Added
+- **Create nested secrets from the Add form** — the API has always accepted an explicit path and creates the intermediate levels, but the UI only ever offered service plus key, so nesting could not be created by hand. Add now has an optional **Group** field: put the key inside a group under the service, and use `/` to nest deeper. A live preview shows exactly where the secret will land (`service > group > key`) so nesting is not guesswork. The field is hidden while editing, since editing targets an existing path. ([#18](../../issues/18))
+
+## [1.8.3] — 2026-07-22
+
+### Fixed
+- **The native window can never offer Touch ID, and now says so** — `--native` renders through pywebview, which on macOS is a WKWebView. macOS does not grant platform-authenticator access to an embedded webview, so the biometric prompt can never appear there no matter what the app does. Settings now explains this instead of showing an Enable button that cannot work, and attempting enrolment from the native window opens the app in the default browser, where it does work.
+
+## [1.8.2] — 2026-07-22
+
+### Fixed
+- **"Enrolment cancelled" with no way to tell why** — a window can expose the WebAuthn API while having no platform authenticator behind it (embedded webviews, "add to dock" web apps). `navigator.credentials.create()` then rejects instantly with `NotAllowedError`, which is indistinguishable from the user pressing Cancel, so the app reported a cancellation the user never made. Enrolment now checks `isUserVerifyingPlatformAuthenticatorAvailable()` first and says which window to use instead. The Settings row reports the same thing rather than showing an Enable button that cannot work.
+
+### Added
+- **`tests/test_webauthn.py`** — 16 cases covering the emitted registration options and every rejection path in assertion verification: missing user-verification flag, wrong origin, RP ID hash mismatch, tampered signature, replayed challenge, unknown credential, and a non-increasing signature counter. Also asserts the stored credential never contains private material and the user handle carries no identity.
+
+## [1.8.1] — 2026-07-22
+
+### Fixed
+- **Biometric enrolment always failed with `SecurityError: The effective domain of the document is not a valid domain`** — the app opened itself at `http://127.0.0.1`, and WebAuthn does not accept an IP literal as a Relying Party ID. An RP ID must be a real domain, and `localhost` is the one non-registrable name the spec allows. The app now opens `http://localhost` (same loopback socket, so nothing else changes) and maps any loopback bind address to `localhost` server-side. A deliberate LAN bind via `PX_SECRETS_HOST` is preserved rather than rewritten, so that deployment still opens a URL the server is actually listening on. Covered by `tests/test_browse_host.py`.
+- **Opening the app over a LAN address or a container port map now explains itself** — instead of the browser throwing a bare `SecurityError`, enrolment returns a message saying biometrics need `http://localhost` because WebAuthn requires a domain name.
+- **Error toasts rendered in the success colour** — a failure appeared in green, which reads as "it worked" at a glance. Toasts now take a kind, failures render in the danger colour, and a heuristic catches older call sites that announce a failure in their text.
+
+## [1.8.0] — 2026-07-22
+
+### Added
+- **Biometric unlock** — unlock with Touch ID, Face ID or Windows Hello instead of re-typing the master password at every idle timeout. This is the follow-up promised in [#19](../../issues/19). Built on WebAuthn platform authenticators: the private key never leaves the device's secure enclave, and `userVerification` is **required** both in the request options and re-checked server-side in the authenticator-data flags, so a mere presence tap cannot substitute for a biometric. Enrolment requires an already-unlocked session, which prevents someone at your keyboard from enrolling their own finger while you are away. The master password always remains available as the recovery path, so a lost or reset device can never lock you out. Enable in **Settings → Biometric Unlock**.
+  - **No new dependencies.** Attestation objects are never parsed: the browser's `getPublicKey()` returns the key as SPKI DER, which `cryptography` consumes directly. That removes a CBOR dependency and an entire class of parsing bugs. Attestation is deliberately not verified — this authenticates "the same authenticator that enrolled" on a local single-user app; it is not enterprise device-provenance.
+  - Credential metadata lives in `~/.px-secrets/webauthn.json` (mode 0600). Only credential IDs and **public** keys are stored.
+
+### Fixed
+- **Vault switcher was invisible whenever the app lock was enabled** — `initApp()` returns early while locked, and the unlock path called `loadVault()` (contents) but never `loadVaults()` (the switcher list). The `<select>` therefore stayed `display:none` forever: you could create vaults but never see or switch between them. Both unlock paths now populate it. ([#21](../../issues/21))
+- **`loadVaults()` swallowed every error in an empty `catch`** — a failed vault list looked identical to "this feature does not exist", which is exactly what hid the bug above. Failures now log to the console and surface a toast.
+
+### Changed
+- **Responsive toolbar** — the toolbar was a single non-wrapping flex row, so adding the vault switcher pushed **Export** outside the viewport with no way to scroll to it. It now wraps; the search field takes its own full-width row below 760px; buttons and the vault selector shrink at narrow widths; long vault names ellipsize instead of dictating row width; and the search placeholder shortens on small screens. These are the first media queries in the project.
+
 ## [1.7.0] — 2026-06-08
 
 ### Added
